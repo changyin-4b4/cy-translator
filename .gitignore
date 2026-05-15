@@ -1,0 +1,12 @@
+# 根目录配置文件
+/config.json
+
+# 本地数据目录
+/data/
+
+# 本地工具目录
+/.claude/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
