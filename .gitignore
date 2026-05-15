@@ -1,5 +1,6 @@
 # 根目录配置文件
 /config.json
+/translator.ico
 
 # 本地数据目录
 /data/
@@ -10,3 +11,11 @@
 # Python 缓存
 __pycache__/
 *.py[cod]
+
+# 本地运行缓存
+/cache_store.json
+
+# PyInstaller 打包产物
+/build/
+/dist/
+/translator.spec
