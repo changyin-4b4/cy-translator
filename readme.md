@@ -92,6 +92,9 @@ python main.py
 - 扫描版（图片型）PDF 暂不支持，需要 PDF 内有可选中的文字层
 - 公式密集区域的回捞效果取决于 PDF 本身的文字编码质量
 - 最小单元是单词，是无法选中字母的，只测试过英文文献
+- 直接下载 Release 中的 exe
+首次运行可能触发 Windows SmartScreen 警告，点击"更多信息"→"仍要运行"即可，这是未签名程序的正常现象。
+以及，exe 需要与 `translator.png`、`note.png` 、`note.png` 和 `translator.ico` 放在同一目录下，Release 中已包含，可以替换为自己的图片，文件名保持一致即可。
 
 ## License
 
