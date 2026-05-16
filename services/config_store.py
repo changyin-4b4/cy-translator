@@ -26,6 +26,7 @@ DEFAULTS = {
     "mode_b_auto_translate": True,
     "window_size": "1920x1080",
     "auto_complete_enabled": False,
+    "toc_collapsed": False,
     "pdf_history": [],
 }
 
@@ -168,12 +169,12 @@ def get_or_create_pdf_history_entry(config: dict, pdf_path: str) -> dict:
     history: list = config.setdefault("pdf_history", [])
     for entry in history:
         if isinstance(entry, dict) and entry.get("path") == pdf_path:
-            entry.setdefault("config", {"cache_file": None, "isolate_file": None, "dual_column": False})
+            entry.setdefault("config", {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None})
             return entry
     entry = {
         "path": pdf_path,
         "date": datetime.now().strftime("%Y-%m-%d-%H-%M-%S"),
-        "config": {"cache_file": None, "isolate_file": None, "dual_column": False},
+        "config": {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None},
     }
     history.insert(0, entry)
     return entry

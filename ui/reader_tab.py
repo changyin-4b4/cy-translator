@@ -179,6 +179,7 @@ class ReaderTab(QWidget):
         self._suppress_fast_save = False
         self._has_result = False
         self._pending_sentences: dict | None = None
+        self._translating: bool = False
         self._setup_ui()
         self._restore()
 
@@ -545,6 +546,7 @@ class ReaderTab(QWidget):
         self.fast_result.setTextCursor(cursor)
         self.fast_result.setPlainText(text)
         self._has_result = True
+        self._translating = False
 
     def _show_translating(self):
         """Append gray italic '翻译中……' indicator before firing API request."""
@@ -593,6 +595,8 @@ class ReaderTab(QWidget):
 
     def on_context_menu_translate(self, text: str):
         """Called by main_app when user right-clicks → 翻译选中文本."""
+        if self._translating:
+            return
         self._last_pdf_selection = text
         self._ensure_per_pdf_paths()
         # If pending sentences exist, use them (phase 2) for both ON/OFF
@@ -616,6 +620,7 @@ class ReaderTab(QWidget):
                 for i, sub in enumerate(sub_sentences):
                     sub["is_head_fragment"] = (i == 0 and head_frag)
                     sub["is_tail_fragment"] = (i == len(sub_sentences) - 1 and tail_frag)
+                self._translating = True
                 self._do_fast_translate(
                     text, cache_mode="sentence",
                     sentence_meta={
@@ -627,13 +632,18 @@ class ReaderTab(QWidget):
                 return
         # Fall back to phrase mode if sentence-mode coordinates unavailable
         if cache_mode == "sentence":
+            self._translating = True
             self._do_fast_translate(text, cache_mode="phrase")
         else:
+            self._translating = True
             self._do_fast_translate(text, cache_mode="phrase")
 
     # ── Phrase handler ─────────────────────────────────────────
 
     def _handle_phrase(self, text: str):
+        if self._translating:
+            return
+        self._translating = True
         self._pending_sentences = None
         self._ensure_per_pdf_paths()
         self._cache = load_cache(self._cache_path)
@@ -647,6 +657,8 @@ class ReaderTab(QWidget):
         self.cache_hint.hide()
         if self.fast_auto_check.isChecked():
             self._do_fast_translate(text, cache_mode="phrase")
+        else:
+            self._translating = False
 
     # ── Sentence auto-complete handler (two-phase) ───────────────
 
@@ -686,11 +698,16 @@ class ReaderTab(QWidget):
 
     def _execute_auto_translate(self):
         """Phase 2: gap detection + translate using self._pending_sentences."""
+        if self._translating:
+            return
+        self._translating = True
         pending = self._pending_sentences
         if not pending:
+            self._translating = False
             return
         sub_sentences = pending["sentences"]
         if not sub_sentences:
+            self._translating = False
             return
 
         self._ensure_per_pdf_paths()
@@ -758,8 +775,15 @@ class ReaderTab(QWidget):
             return
 
         # ── Has gaps ────────────────────────────────────────────────
-        gap_src = " ".join(sub_sentences[i]["src"] for i in gap_indices)
-        self._show_gap_dialog(gap_src, pending, gap_indices, overlapping)
+        if not overlapping:
+            # No cache overlap at all → full translate without dialog
+            self._do_auto_translate(
+                pending["expanded_text"], pending,
+                list(range(len(sub_sentences))), [], is_incremental=False,
+            )
+        else:
+            gap_src = " ".join(sub_sentences[i]["src"] for i in gap_indices)
+            self._show_gap_dialog(gap_src, pending, gap_indices, overlapping)
 
     # ── Gap dialog ───────────────────────────────────────────────
 
@@ -796,6 +820,7 @@ class ReaderTab(QWidget):
         ))
 
         dlg.setModal(False)
+        dlg.rejected.connect(lambda: setattr(self, "_translating", False))
         dlg.show()
         self._gap_dialog = dlg  # keep reference to prevent GC
 
@@ -830,6 +855,27 @@ class ReaderTab(QWidget):
         self._cache = load_cache(self._cache_path)
 
         if is_incremental:
+            # Fill non-gap sub-sentences from cache first
+            cache_subs: list[dict] = []
+            if overlapping:
+                group = _get_group(self._cache, self._current_file, self._is_dual)
+                for idx in overlapping:
+                    entry = group["sentences"][idx]
+                    for sub in entry.get("sentences", []):
+                        cache_subs.append(sub)
+            for psub_idx, psub in enumerate(sub_sentences):
+                if psub_idx in gap_indices:
+                    continue
+                for csub in cache_subs:
+                    if not coord_le_tolerant(
+                        csub["end_page"], csub["end_y_pct"], csub["end_x_pct"],
+                        psub["start_page"], psub["start_y_pct"], psub["start_x_pct"],
+                    ) and not coord_le_tolerant(
+                        psub["end_page"], psub["end_y_pct"], psub["end_x_pct"],
+                        csub["start_page"], csub["start_y_pct"], csub["start_x_pct"],
+                    ):
+                        psub["tgt"] = csub.get("tgt", "")
+                        break
             # Fill gap sub-sentences
             gap_tgt_parts = split_translation(data, len(gap_indices))
             for gi, idx in enumerate(gap_indices):
@@ -843,6 +889,8 @@ class ReaderTab(QWidget):
             for i in range(len(sub_sentences)):
                 if i < len(all_tgt_parts):
                     sub_sentences[i]["tgt"] = all_tgt_parts[i]
+            merged = "".join(s.get("tgt", "") for s in sub_sentences)
+            self._show_result(merged)
 
         # Build entry and write cache
         new_entry = {
@@ -901,11 +949,16 @@ class ReaderTab(QWidget):
 
     def _execute_sentence_manual(self):
         """Phase 2: cache check → extract or LLM translate → cache write."""
+        if self._translating:
+            return
+        self._translating = True
         pending = self._pending_sentences
         if not pending:
+            self._translating = False
             return
         sub_sentences = pending["sentences"]
         if not sub_sentences:
+            self._translating = False
             return
 
         self._ensure_per_pdf_paths()
@@ -1194,6 +1247,9 @@ class ReaderTab(QWidget):
     # ── Persist translate (manual input → file) ────────────────────
 
     def _start_persist_translate(self):
+        if self._translating:
+            return
+        self._translating = True
         errors = []
         user_text = self.persist_input.toPlainText().strip()
         if not user_text:
@@ -1231,6 +1287,7 @@ class ReaderTab(QWidget):
                     QMessageBox.Yes | QMessageBox.No,
                 )
                 if reply != QMessageBox.Yes:
+                    self._translating = False
                     return
             output_kwargs = {"mode": "new", "directory": d, "filename": name}
         else:
@@ -1244,6 +1301,7 @@ class ReaderTab(QWidget):
             output_kwargs = {"mode": "append", "file_path": f}
 
         if errors:
+            self._translating = False
             QMessageBox.warning(self, "输入错误", "\n".join(errors))
             return
 
@@ -1262,6 +1320,7 @@ class ReaderTab(QWidget):
         )
 
     def _on_persist_done(self, ok, data):
+        self._translating = False
         self.persist_translate_btn.setEnabled(True)
         if ok:
             # persist validated model

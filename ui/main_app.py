@@ -89,6 +89,24 @@ class _PerPdfConfigDialog(QDialog):
         self._isolate_status = QLabel("")
         layout.addWidget(self._isolate_status)
 
+        # ── Note file row ──
+        note_layout = QHBoxLayout()
+        note_layout.addWidget(QLabel("笔记文件:"))
+        self._note_edit = QLineEdit()
+        self._note_edit.setText(cfg.get("note_file") or "")
+        note_layout.addWidget(self._note_edit)
+        note_browse = QPushButton("...")
+        note_browse.clicked.connect(
+            lambda: self._browse_file(self._note_edit))
+        note_layout.addWidget(note_browse)
+        note_clear = QPushButton("清除绑定")
+        note_clear.clicked.connect(
+            lambda: self._reset_path(self._note_edit))
+        note_layout.addWidget(note_clear)
+        layout.addLayout(note_layout)
+        self._note_status = QLabel("")
+        layout.addWidget(self._note_status)
+
         # ── Buttons ──
         btn_layout = QHBoxLayout()
         save_btn = QPushButton("保存")
@@ -210,10 +228,13 @@ class _PerPdfConfigDialog(QDialog):
     def _save_and_accept(self):
         cache_val = self._cache_edit.text().strip() or None
         isolate_val = self._isolate_edit.text().strip() or None
+        note_val = self._note_edit.text().strip() or None
         set_pdf_config_path(self._config, self._pdf_path,
                             "cache_file", cache_val)
         set_pdf_config_path(self._config, self._pdf_path,
                             "isolate_file", isolate_val)
+        set_pdf_config_path(self._config, self._pdf_path,
+                            "note_file", note_val)
         save_config(self._config)
         self.accept()
 
@@ -366,18 +387,26 @@ class MainApp(QWidget):
 
         root.addWidget(top_bar, 0)
 
-        # ── Body: QSplitter ────────────────────────────────────────
+        # ── Body: TOC sidebar + QSplitter ──────────────────────────
         self._splitter = QSplitter()
         self._splitter.setChildrenCollapsible(False)
 
         self.pdf_viewer = PDFViewer()
-        self._splitter.addWidget(self.pdf_viewer)
+        self._toc_panel = self.pdf_viewer.toc_panel
+
+        self._left_area = QWidget()
+        left_layout = QHBoxLayout(self._left_area)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(self._toc_panel)
+        left_layout.addWidget(self.pdf_viewer)
 
         self.reader_tab = ReaderTab(self._config)
         self.reader_tab.setMinimumWidth(500)
+
+        self._splitter.addWidget(self._left_area)
         self._splitter.addWidget(self.reader_tab)
 
-        # Placeholder: actual sizes set in _apply_initial_spliter after window sized
         self._splitter.setSizes([300, RIGHT_PANEL_WIDTH])
 
         root.addWidget(self._splitter, 1)
@@ -386,6 +415,8 @@ class MainApp(QWidget):
         self.pdf_viewer.context_menu_requested.connect(self._on_pdf_context_menu)
         self.pdf_viewer.auto_complete_changed.connect(self._on_auto_complete_changed)
         self.pdf_viewer.selection_started.connect(self.reader_tab._on_selection_started)
+        self.pdf_viewer.toc_collapsed_changed.connect(self._on_toc_collapsed_changed)
+        self.pdf_viewer.note_path_needed.connect(self._ensure_note_path)
 
         self.reader_tab.inject_pdf_viewer(self.pdf_viewer)
 
@@ -423,7 +454,7 @@ class MainApp(QWidget):
     def _add_pdf_history(self, path: str):
         history: list = self._config.get("pdf_history", [])
         # Inherit config from existing entry for the same path
-        old_config = {"cache_file": None, "isolate_file": None, "dual_column": False}
+        old_config = {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None}
         for e in history:
             if isinstance(e, dict) and e.get("path") == path:
                 old_config = e.get("config", old_config)
@@ -447,6 +478,11 @@ class MainApp(QWidget):
         self.file_label.setText(os.path.basename(path))
         self.pdf_viewer.load_file(path)
         self.reader_tab.set_current_file(path)
+        # Restore note file binding
+        entry = get_or_create_pdf_history_entry(self._config, path)
+        note_file = entry.get("config", {}).get("note_file")
+        self.pdf_viewer.set_note_path(note_file)
+        self.pdf_viewer.load_notes()
 
     def _on_pdf_selection(self, lo, hi, text):
         self.reader_tab.set_last_selection(text)
@@ -455,6 +491,24 @@ class MainApp(QWidget):
     def _on_auto_complete_changed(self, enabled: bool):
         self._config["auto_complete_enabled"] = enabled
         save_config(self._config)
+
+    def _on_toc_collapsed_changed(self, collapsed: bool):
+        self._config["toc_collapsed"] = collapsed
+        save_config(self._config)
+
+    def _ensure_note_path(self):
+        """Auto-generate a note file path for the current PDF if not set."""
+        if not self._current_pdf:
+            return
+        entry = get_or_create_pdf_history_entry(self._config, self._current_pdf)
+        cfg = entry.setdefault("config", {})
+        if not cfg.get("note_file"):
+            from services.cache_store import auto_generate_per_pdf_path
+            note_file = auto_generate_per_pdf_path(self._current_pdf, "_note")
+            set_pdf_config_path(self._config, self._current_pdf,
+                               "note_file", note_file)
+            save_config(self._config)
+            self.pdf_viewer.set_note_path(note_file)
 
     def _on_pdf_context_menu(self, text):
         menu = QMenu(self)
@@ -494,5 +548,6 @@ class MainApp(QWidget):
         if len(sizes) == 2:
             self._config["right_panel_width"] = sizes[1]
             save_config(self._config)
+        self.pdf_viewer.save_notes_force()
         self.pdf_viewer.shutdown()
         super().closeEvent(event)

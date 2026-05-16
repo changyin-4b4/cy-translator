@@ -124,7 +124,6 @@ def split_sentences(words, lo: int, hi: int) -> list[dict]:
     sentences = []
     current_start = lo
     for i in range(lo, hi + 1):
-        """print(f"词{i}: '{words[i].text}' | x0={words[i].x0_pct:.3f} x1={words[i].x1_pct:.3f}")"""
         text = words[i].text.strip()
         if text and text[-1] in SENTENCE_ENDS and i < hi:
             sentences.append(_build_sub_entry(words, current_start, i))
