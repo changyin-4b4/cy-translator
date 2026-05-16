@@ -44,10 +44,6 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
     page_start = lo
     while page_start > 0 and words[page_start - 1].page_idx == page:
         page_start -= 1
-    page_end = hi
-    while page_end < n - 1 and words[page_end + 1].page_idx == page:
-        page_end += 1
-
     # ── Baseline statistics from selection ──────────────────────────
     sizes = [w.size for w in words[lo:hi + 1] if w.size > 0]
     median_size = sorted(sizes)[len(sizes) // 2] if sizes else 0.0
@@ -66,7 +62,7 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
     x0_vals = [w.x0_pct for w in words[lo:hi + 1]]
     x0_median = sorted(x0_vals)[len(x0_vals) // 2] if x0_vals else 0.0
 
-    # Left scan within page
+    # Left scan within lo's page
     new_lo = page_start
     head_fragment = True
     for i in range(lo - 1, page_start - 1, -1):
@@ -80,14 +76,19 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
             head_fragment = False
             break
 
-    # Right scan within page
+    # Right scan within hi's own page
+    hi_page = words[hi].page_idx
+    hi_page_end = hi
+    while hi_page_end < n - 1 and words[hi_page_end + 1].page_idx == hi_page:
+        hi_page_end += 1
+
     if is_sentence_end(words[hi].text):
         new_hi = hi
         tail_fragment = False
     else:
-        new_hi = page_end
+        new_hi = hi_page_end
         tail_fragment = True
-        for i in range(hi + 1, page_end + 1):
+        for i in range(hi + 1, hi_page_end + 1):
             if is_sentence_end(words[i].text):
                 new_hi = i
                 tail_fragment = False

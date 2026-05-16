@@ -239,6 +239,18 @@ def merge_entries(cache: dict, file_path: str, indices: list[int],
         all_subs.extend(e.get("sentences", []))
     all_subs.sort(key=_sub_first)
 
+    # Deduplicate by full start coordinate, keep the one with non-empty tgt
+    seen: dict[tuple, int] = {}
+    deduped: list[dict] = []
+    for sub in all_subs:
+        key = (sub["start_page"], sub["start_y_pct"], sub["start_x_pct"])
+        if key not in seen:
+            seen[key] = len(deduped)
+            deduped.append(sub)
+        elif sub["tgt"]:
+            deduped[seen[key]] = sub
+    all_subs = deduped
+
     if all_subs:
         all_subs[0]["is_head_fragment"] = (
             entries[0].get("head_fragment", False) or

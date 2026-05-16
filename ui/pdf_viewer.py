@@ -217,7 +217,7 @@ class TOCPanel(QWidget):
         self._tree.setRootIsDecorated(True)
         self._tree.setIndentation(16)
         self._tree.setStyleSheet(
-            "QTreeWidget { background-color: #2a2a2a; color: #ccc; border: none; }"
+            "QTreeWidget { background-color: #2a2a2a; color: #ccc; border: none; font-size: 16px; }"
         )
         self._tree.itemClicked.connect(self._on_item_clicked)
         content_layout.addWidget(self._tree)
