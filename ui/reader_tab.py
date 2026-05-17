@@ -42,10 +42,12 @@ from services.cache_store import (
 from services.config_store import (
     save_config,
     add_base_url,
+    remove_base_url,
     set_url_key,
     get_url_key,
     get_url_models,
     add_model_to_url,
+    remove_model_from_url,
     set_models_for_url,
     add_prompt_file,
     get_or_create_pdf_history_entry,
@@ -159,8 +161,131 @@ class _CacheManageDialog(QDialog):
             self._list.takeItem(row)
 
 
-# ── URL manage dialog (reuse from main_window) ───────────────────────
-from ui.main_window import _UrlManageDialog
+# ── URL management dialogs ─────────────────────────────────────────
+
+class _UrlDetailDialog(QDialog):
+    """Level 2: manage a single URL's key and models."""
+
+    def __init__(self, config: dict, url: str, parent=None):
+        super().__init__(parent)
+        self._config = config
+        self._url = url
+        self._key_visible = False
+        self.setWindowTitle(f"URL 详情 — {url}")
+        self.setMinimumWidth(550)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(f"<b>URL:</b> {self._url}"))
+
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("<b>Key:</b>"))
+        self._key_label = QLineEdit()
+        self._key_label.setReadOnly(True)
+        self._key_label.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_label.setText(get_url_key(self._config, self._url))
+        key_row.addWidget(self._key_label)
+
+        self._toggle_key_btn = QPushButton("显示")
+        self._toggle_key_btn.setFixedWidth(60)
+        self._toggle_key_btn.clicked.connect(self._toggle_key)
+        key_row.addWidget(self._toggle_key_btn)
+        layout.addLayout(key_row)
+
+        layout.addWidget(QLabel("<b>模型列表:</b>"))
+        self._model_list = QListWidget()
+        self._rebuild_models()
+        layout.addWidget(self._model_list)
+
+        del_model_btn = QPushButton("删除选中模型")
+        del_model_btn.clicked.connect(self._delete_model)
+        layout.addWidget(del_model_btn)
+
+    def _rebuild_models(self):
+        self._model_list.clear()
+        models = get_url_models(self._config, self._url)
+        for m in models:
+            self._model_list.addItem(m)
+
+    def _toggle_key(self):
+        self._key_visible = not self._key_visible
+        if self._key_visible:
+            self._key_label.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._toggle_key_btn.setText("隐藏")
+        else:
+            self._key_label.setEchoMode(QLineEdit.EchoMode.Password)
+            self._toggle_key_btn.setText("显示")
+
+    def _delete_model(self):
+        row = self._model_list.currentRow()
+        if row < 0:
+            return
+        model = self._model_list.item(row).text()
+        remove_model_from_url(self._config, self._url, model)
+        save_config(self._config)
+        self._rebuild_models()
+
+
+class _UrlManageDialog(QDialog):
+    """Level 1: manage all saved URLs."""
+
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self._config = config
+        self.setWindowTitle("管理 URL 缓存")
+        self.setMinimumWidth(550)
+        layout = QVBoxLayout(self)
+
+        self._list = QListWidget()
+        self._rebuild()
+        self._list.itemDoubleClicked.connect(self._open_detail)
+        layout.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        detail_btn = QPushButton("详情 / 管理模型")
+        detail_btn.clicked.connect(self._open_detail)
+        btn_row.addWidget(detail_btn)
+
+        del_btn = QPushButton("删除选中 URL")
+        del_btn.clicked.connect(self._delete_selected)
+        btn_row.addWidget(del_btn)
+        layout.addLayout(btn_row)
+
+    def _rebuild(self):
+        self._list.clear()
+        for url, entry in self._config.get("base_urls", {}).items():
+            model_count = len(entry.get("models", []))
+            label = f"{url}  —  Models: {model_count}"
+            self._list.addItem(label)
+
+    def _get_selected_url(self):
+        row = self._list.currentRow()
+        if row < 0:
+            return None
+        urls = list(self._config.get("base_urls", {}).keys())
+        if row < len(urls):
+            return urls[row]
+        return None
+
+    def _open_detail(self):
+        url = self._get_selected_url()
+        if not url:
+            return
+        dlg = _UrlDetailDialog(self._config, url, self)
+        dlg.exec()
+        save_config(self._config)
+        self._rebuild()
+
+    def _delete_selected(self):
+        url = self._get_selected_url()
+        if not url:
+            return
+        remove_base_url(self._config, url)
+        save_config(self._config)
+        self._rebuild()
+
 
 # ── Unified right panel ──────────────────────────────────────────────
 

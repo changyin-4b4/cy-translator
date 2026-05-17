@@ -1653,12 +1653,36 @@ class PDFViewer(QWidget):
         menu = QMenu()
         action = menu.addAction("删除")
         action.triggered.connect(lambda: self._delete_zone(zi))
+        spread_action = menu.addAction("扩散至全文")
+        spread_action.triggered.connect(lambda: self._spread_zone_to_all_pages(zi))
         menu.exec(QCursor.pos())
 
     def _delete_zone(self, zi: int):
         if 0 <= zi < len(self._zones):
             self._zones.pop(zi)
         self._selected_zone_idx = -1
+        self._rebuild_word_lists()
+        self._save_zones()
+        self._render_zones()
+
+    def _spread_zone_to_all_pages(self, zi: int):
+        if not (0 <= zi < len(self._zones)):
+            return
+        zone = self._zones[zi]
+        x0, y0, x1, y1 = zone["x0"], zone["y0"], zone["x1"], zone["y1"]
+        total_pages = len(self._doc) if self._doc else 0
+        for page_idx in range(total_pages):
+            if page_idx == zone["page"]:
+                continue
+            duplicate = any(
+                z["page"] == page_idx
+                and z["x0"] == x0 and z["y0"] == y0
+                and z["x1"] == x1 and z["y1"] == y1
+                for z in self._zones
+            )
+            if duplicate:
+                continue
+            self._zones.append({"page": page_idx, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
         self._rebuild_word_lists()
         self._save_zones()
         self._render_zones()

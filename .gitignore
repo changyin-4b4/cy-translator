@@ -1,6 +1,6 @@
 # 根目录配置文件
 /config.json
-/translator.ico
+/build_release.py
 
 # 本地数据目录
 /data/
@@ -17,6 +17,5 @@ __pycache__/
 
 # PyInstaller 打包产物
 /build/
-dist/*
-!dist/translator.exe
+/dist/
 /translator.spec
