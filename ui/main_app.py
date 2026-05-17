@@ -476,10 +476,14 @@ class MainApp(QWidget):
     def _load_pdf(self, path: str):
         self._current_pdf = path
         self.file_label.setText(os.path.basename(path))
-        self.pdf_viewer.load_file(path)
         self.reader_tab.set_current_file(path)
-        # Restore note file binding
+        self.pdf_viewer.load_file(path)
+        # Restore isolate_path (cleared by _full_cleanup) and reload zones
         entry = get_or_create_pdf_history_entry(self._config, path)
+        isolate_file = entry.get("config", {}).get("isolate_file")
+        self.pdf_viewer.set_isolate_path(isolate_file)
+        self.pdf_viewer.load_zones()
+        # Restore note file binding
         note_file = entry.get("config", {}).get("note_file")
         self.pdf_viewer.set_note_path(note_file)
         self.pdf_viewer.load_notes()

@@ -557,6 +557,7 @@ class PDFViewer(QWidget):
         self._words_inside.clear()
         self._active_words = None
         self._rendered_pages.clear()
+        self._isolate_path = None
         self._toc_panel.load_toc(None)
 
     # ── Render ─────────────────────────────────────────────────────
