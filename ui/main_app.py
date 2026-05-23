@@ -305,7 +305,13 @@ class PdfHistoryDialog(QDialog):
                 display_date = date_str
 
             item = QListWidgetItem()
-            item.setText(f"{os.path.basename(path)}\n{display_date}")
+            name = os.path.basename(path)
+            MAX_LEN = 50
+            if len(name) > MAX_LEN:
+                display_name = name[:15] + "…" + name[-15:]
+            else:
+                display_name = name
+            item.setText(f"{display_name}\n{display_date}")
             item.setToolTip(path)
             item.setData(Qt.ItemDataRole.UserRole, path)
             self._list.addItem(item)

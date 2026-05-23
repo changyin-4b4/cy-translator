@@ -679,6 +679,70 @@ for each line in selected words:
 
 通过信号 `finished` 回传结果，不阻塞 UI。
 
+## 5.8 删除缓存条目
+
+### 快速删除（"删除缓存"按钮）
+
+每次翻译完成后解封右侧面板的"删除缓存"按钮。按钮通过 `_last_cache_key` 定位当前显示结果对应的缓存条目：
+
+- **phrase 条目**：按 `src` 字段精确字符串匹配
+- **sentence 条目**：按 `start_idx` / `end_idx` 范围精确包含匹配（`entry.subs[0].start_idx <= key.start_idx and key.end_idx <= entry.subs[-1].end_idx`）
+
+删除后立即 `save_cache()` 持久化，并在显示区追加 `[缓存已删除，下次将重新翻译]` 提示。
+
+### 句级管理（"管理条目"二级对话框）
+
+`_CacheManageDialog`（一级）新增"管理条目"按钮，选中缓存文件后可用。点击打开 `_EntryManageDialog`（二级）：
+
+- 仅显示 **sentence** 条目（不显示 phrase 条目），按 `start_idx` 升序排列
+- 每条显示原文/译文（超过 120 字截断，tooltip 显示完整内容）+ "删除"按钮
+- 点击删除：通过 `start_idx` 定位缓存条目并从文件删除即时保存，列表即时重建刷新（无确认弹窗）
+- 关闭二级对话框后，一级页面重新读取缓存文件更新条目统计数字
+
+### 与翻译历史的交互
+
+点击"删除缓存"后，当前翻译历史条目被标记为 `deleted=True`（不立即移除）。下一次划词选择时（`on_pdf_selection` 入口），`_purge_deleted_entries()` 扫描并清除所有标记为 deleted 的历史条目及其显示控件。
+
+## 5.9 半持久翻译历史
+
+### 数据模型
+
+```python
+self._history: list[dict] = []
+# 每项结构：{"tgt": str, "start_idx": int, "end_idx": int, "timestamp": "14:23:05", "deleted": bool}
+```
+
+- 上限 500 条，超出时从头部删除最旧的 100 条
+- 仅存于内存，关闭应用即释放，不写入任何文件
+- 切换 PDF 时自动清空
+
+### 显示区
+
+翻译结果区由 `QTextEdit` 改为 `QScrollArea` + 控件列表：
+
+- **追加模式**：每条新翻译追加到列表底部，不再清空旧内容
+- **记录格式**：分隔线（`─`×60）+ 时间戳 + 译文（`_ClickableLabel`，可选文本）
+- **分隔线逻辑**：每次新划词（`on_pdf_selection`）插入"以上为历史消息"分隔行；翻译结果返回后删除分隔行并追加新记录
+
+### 虚拟滚动
+
+- 显示区最多同时渲染 100 条记录的 widget
+- **追加时**：超过 100 条则删除顶部 50 条旧 widget，`_render_start += 50`
+- **向上滚动**：scrollbar 到达顶端时从 `_history` 前段取 50 条插入顶部，同时删除底部 50 条，通过 `sizeHint` 累计高度保持滚动位置不跳动
+- **回到底部按钮**：若最新记录未渲染则清空显示区从末尾重新取 100 条渲染并滚动到底
+
+### 导航跳转
+
+点击/右键历史条目 → `pdf_viewer.navigate_to_range(start_idx, end_idx)`：
+
+1. 调用 `set_highlight_range` 设置高亮
+2. 计算 `start_idx` 对应词的 scene Y 坐标
+3. 设置 `verticalScrollBar().setValue(word_scene_y - viewport_height / 2)`，使该词位于可视区域垂直中心
+
+### 横向滚动禁止
+
+历史显示区设置 `setHorizontalScrollBarPolicy(ScrollBarAlwaysOff)`，译文 `QLabel` 开启 `setWordWrap(True)` 确保自动折行。
+
 ***
 
 # 6. 模块间耦合关系

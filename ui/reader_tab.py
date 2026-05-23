@@ -1,20 +1,28 @@
 import os
+from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from datetime import datetime
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QScrollBar,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -121,6 +129,95 @@ class _PersistTranslateWorker(QThread):
             self.finished.emit(False, str(e))
 
 
+# ── Entry manage dialog (sentence-level delete) ──────────────────────
+
+class _EntryManageDialog(QDialog):
+    def __init__(self, cache_path: str, file_path: str, parent=None):
+        super().__init__(parent)
+        self._cache_path = cache_path
+        self._file_path = file_path
+        self.setWindowTitle(f"管理条目 — {Path(file_path).name}")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(400)
+        layout = QVBoxLayout(self)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        inner = QWidget()
+        self._entry_layout = QVBoxLayout(inner)
+        self._entry_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._scroll.setWidget(inner)
+        layout.addWidget(self._scroll)
+
+        self._populate()
+
+    @staticmethod
+    def _truncate(text: str) -> str:
+        if len(text) > 120:
+            return text[:120] + "…"
+        return text
+
+    def _populate(self):
+        cache = load_cache(self._cache_path)
+        group = _ensure_file(cache, self._file_path)
+        sentences = group.get("sentences", [])
+        sentences.sort(key=lambda e: e.get("sentences", [{}])[0].get("start_idx", 0))
+
+        for entry in sentences:
+            src_text = entry.get("src", "")
+            tgt_text = entry.get("tgt", "")
+
+            row = QFrame()
+            row.setFrameStyle(QFrame.Shape.StyledPanel)
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(6, 4, 6, 4)
+
+            text_area = QVBoxLayout()
+            src_label = QLabel(self._truncate(src_text))
+            src_label.setWordWrap(True)
+            src_label.setToolTip(src_text)
+            text_area.addWidget(src_label)
+
+            tgt_label = QLabel(self._truncate(tgt_text))
+            tgt_label.setWordWrap(True)
+            tgt_label.setToolTip(tgt_text)
+            text_area.addWidget(tgt_label)
+
+            hl.addLayout(text_area, 1)
+
+            del_btn = QPushButton("删除")
+            del_btn.setFixedWidth(48)
+            del_btn.setStyleSheet("color: red;")
+            del_btn.clicked.connect(lambda checked, e=entry: self._delete_entry(e))
+            hl.addWidget(del_btn)
+
+            self._entry_layout.addWidget(row)
+
+        self._entry_layout.addStretch()
+
+    def _rebuild_list(self):
+        while self._entry_layout.count() > 0:
+            item = self._entry_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._populate()
+
+    def _delete_entry(self, entry: dict):
+        cache = load_cache(self._cache_path)
+        group = _ensure_file(cache, self._file_path)
+        entry_start = entry.get("sentences", [{}])[0].get("start_idx", -1)
+        original = group["sentences"]
+        for i, e in enumerate(original):
+            e_start = e.get("sentences", [{}])[0].get("start_idx", -1)
+            if e_start == entry_start:
+                original.pop(i)
+                break
+        save_cache(cache, self._cache_path)
+        # Rebuild the entire list to reflect deletion immediately
+        self._rebuild_list()
+
+
 # ── Cache manage dialog ──────────────────────────────────────────────
 
 class _CacheManageDialog(QDialog):
@@ -139,15 +236,39 @@ class _CacheManageDialog(QDialog):
         else:
             layout.addWidget(QLabel(f"共 {len(summaries)} 个文档的翻译缓存："))
             self._list = QListWidget()
+            self._list.currentRowChanged.connect(self._on_selection_changed)
             for s in summaries:
                 self._list.addItem(f"{s['filename']}  ({s['entry_count']} 条)")
             layout.addWidget(self._list)
 
+            btn_row = QHBoxLayout()
+            self._entry_btn = QPushButton("管理条目")
+            self._entry_btn.setEnabled(False)
+            self._entry_btn.clicked.connect(self._open_entry_manager)
+            btn_row.addWidget(self._entry_btn)
+
             del_btn = QPushButton("删除选中文件的全部缓存")
             del_btn.clicked.connect(self._delete_selected)
-            layout.addWidget(del_btn)
+            btn_row.addWidget(del_btn)
+            layout.addLayout(btn_row)
 
         self._summaries = summaries
+
+    def _on_selection_changed(self, row: int):
+        self._entry_btn.setEnabled(0 <= row < len(self._summaries))
+
+    def _open_entry_manager(self):
+        row = self._list.currentRow()
+        if 0 <= row < len(self._summaries):
+            dlg = _EntryManageDialog(
+                self._cache_path, self._summaries[row]["file_path"], self)
+            dlg.exec()
+            # Refresh entry count
+            cache = load_cache(self._cache_path)
+            self._summaries = get_cache_summary(cache)
+            self._list.clear()
+            for s in self._summaries:
+                self._list.addItem(f"{s['filename']}  ({s['entry_count']} 条)")
 
     def _delete_selected(self):
         row = self._list.currentRow()
@@ -285,6 +406,23 @@ class _UrlManageDialog(QDialog):
         self._rebuild()
 
 
+# ── Clickable label for history records ─────────────────────────────
+
+class _ClickableLabel(QLabel):
+    navigate_requested = Signal(int, int)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.navigate_requested.emit(self._lo, self._hi)
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        action = menu.addAction("跳转到原文位置")
+        action.triggered.connect(lambda: self.navigate_requested.emit(self._lo, self._hi))
+        menu.exec(event.globalPos())
+
+
 # ── Unified right panel ──────────────────────────────────────────────
 
 class ReaderTab(QWidget):
@@ -302,8 +440,14 @@ class ReaderTab(QWidget):
         self._suppress_key_change = False
         self._suppress_fast_save = False
         self._has_result = False
+        self._last_cache_key: dict | None = None
         self._pending_sentences: dict | None = None
         self._translating: bool = False
+        self._history: list[dict] = []
+        self._render_start: int = 0
+        self._history_widgets: list[QWidget] = []
+        self._pending_separator: QWidget | None = None
+        self._translating_label: QWidget | None = None
         self._setup_ui()
         self._restore()
 
@@ -406,6 +550,10 @@ class ReaderTab(QWidget):
         result_header = QHBoxLayout()
         result_header.addWidget(QLabel("翻译结果:"))
         result_header.addStretch()
+        self._delete_cache_btn = QPushButton("删除缓存")
+        self._delete_cache_btn.setEnabled(False)
+        self._delete_cache_btn.clicked.connect(self._on_delete_cache)
+        result_header.addWidget(self._delete_cache_btn)
         result_header.addWidget(QLabel("字号:"))
         self.result_font_spin = QSpinBox()
         self.result_font_spin.setRange(10, 24)
@@ -413,15 +561,24 @@ class ReaderTab(QWidget):
         self.result_font_spin.setFixedWidth(60)
         self.result_font_spin.valueChanged.connect(self._on_result_font_changed)
         result_header.addWidget(self.result_font_spin)
+        self._to_bottom_btn = QPushButton("回到底部")
+        self._to_bottom_btn.clicked.connect(self._scroll_to_history_bottom)
+        result_header.addWidget(self._to_bottom_btn)
         layout.addLayout(result_header)
 
-        self.fast_result = QTextEdit()
-        self.fast_result.setReadOnly(True)
-        self.fast_result.setAcceptRichText(False)
-        self.fast_result.setMinimumHeight(180)
-        self.fast_result.setPlaceholderText("在左侧 PDF 中划选文本，翻译结果将显示在这里...")
-        self._apply_result_font_size(14)
-        layout.addWidget(self.fast_result)
+        self._history_scroll = QScrollArea()
+        self._history_scroll.setWidgetResizable(True)
+        self._history_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._history_scroll.setMinimumHeight(180)
+        self._history_inner = QWidget()
+        self._history_layout = QVBoxLayout(self._history_inner)
+        self._history_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._history_layout.addStretch()
+        self._history_scroll.setWidget(self._history_inner)
+        self._history_scroll.verticalScrollBar().valueChanged.connect(
+            self._on_history_scrolled)
+        layout.addWidget(self._history_scroll)
 
         return w
 
@@ -627,41 +784,156 @@ class ReaderTab(QWidget):
         viewer.isolate_path_needed.connect(
             self._ensure_per_pdf_paths)
 
-    def _show_result(self, text: str) -> None:
-        self.fast_result.clear()
-        cursor = self.fast_result.textCursor()
-        fmt = QTextCharFormat()
-        fmt.setForeground(self.fast_result.palette().text())
-        cursor.setCharFormat(fmt)
-        self.fast_result.setTextCursor(cursor)
-        self.fast_result.setPlainText(text.replace("<br>", ""))
+    def _show_result(self, text: str, start_idx: int = -1, end_idx: int = -1) -> None:
+        # Remove pending separator if present
+        if self._pending_separator is not None:
+            self._history_layout.removeWidget(self._pending_separator)
+            self._pending_separator.deleteLater()
+            self._pending_separator = None
+        # Remove translating indicator if present
+        if self._translating_label is not None:
+            self._history_layout.removeWidget(self._translating_label)
+            self._translating_label.deleteLater()
+            self._translating_label = None
+        if start_idx >= 0 and end_idx >= 0:
+            self._append_record_widget(text, start_idx, end_idx)
+        else:
+            label = QLabel(text)
+            label.setWordWrap(True)
+            self._history_layout.insertWidget(self._history_layout.count() - 1, label)
         self._has_result = True
         self._translating = False
 
+    def _append_record_widget(self, tgt: str, start_idx: int, end_idx: int):
+        tgt = tgt.replace("<br>", "")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        # Store in history (capped at 500)
+        self._history.append({
+            "tgt": tgt, "start_idx": start_idx, "end_idx": end_idx,
+            "timestamp": timestamp,
+            "deleted": False,
+        })
+        if len(self._history) > 500:
+            self._history = self._history[100:]
+            self._render_start = max(0, self._render_start - 100)
+        # Virtual scroll prune
+        self._prune_history_widgets()
+        # Build widget via shared helper
+        self._add_entry_widget(self._history[-1])
+
+    def _prune_history_widgets(self):
+        if len(self._history_widgets) >= 100:
+            for w in self._history_widgets[:50]:
+                self._history_layout.removeWidget(w)
+                w.deleteLater()
+            self._history_widgets = self._history_widgets[50:]
+            self._render_start += 50
+
+    def _on_history_navigate(self, lo: int, hi: int):
+        if self._pdf_viewer is not None:
+            self._pdf_viewer.navigate_to_range(lo, hi)
+
+    def _scroll_to_history_bottom(self):
+        sb = self._history_scroll.verticalScrollBar()
+        if self._render_start + len(self._history_widgets) >= len(self._history):
+            sb.setValue(sb.maximum())
+        else:
+            self._clear_history_display()
+            self._render_start = max(0, len(self._history) - 100)
+            for entry in self._history[self._render_start:]:
+                self._add_entry_widget(entry)
+            sb.setValue(sb.maximum())
+
+    def _on_history_scrolled(self, value: int):
+        if value == 0 and self._render_start > 0:
+            sb = self._history_scroll.verticalScrollBar()
+            count = min(50, self._render_start)
+            for w in self._history_widgets[-count:]:
+                self._history_layout.removeWidget(w)
+                w.deleteLater()
+            self._history_widgets = self._history_widgets[:-count]
+            prepend_entries = self._history[self._render_start - count:self._render_start]
+            new_widgets = []
+            for entry in reversed(prepend_entries):
+                self._add_entry_widget(entry, prepend=True)
+                new_widgets.append(self._history_widgets[0])
+            self._render_start -= count
+            QApplication.processEvents()
+            added_h = sum(w.sizeHint().height() for w in new_widgets)
+            sb.setValue(sb.value() + added_h)
+
+    def _add_entry_widget(self, entry: dict, prepend: bool = False):
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.Shape.NoFrame)
+        fl = QVBoxLayout(frame)
+        fl.setContentsMargins(6, 2, 6, 10)
+        fl.setSpacing(2)
+        sep = QLabel("─" * 60)
+        sep.setStyleSheet("color: #777; font-size: 10px;")
+        fl.addWidget(sep)
+        ts = QLabel(entry["timestamp"])
+        ts.setStyleSheet("color: #999; font-size: 10px;")
+        fl.addWidget(ts)
+        content = _ClickableLabel(entry["tgt"])
+        content.setWordWrap(True)
+        content.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        content.setCursor(Qt.CursorShape.PointingHandCursor)
+        content._lo = entry["start_idx"]
+        content._hi = entry["end_idx"]
+        content.navigate_requested.connect(self._on_history_navigate)
+        self._apply_result_font_size_to_label(content)
+        fl.addWidget(content)
+        if prepend:
+            self._history_layout.insertWidget(0, frame)
+            self._history_widgets.insert(0, frame)
+        else:
+            self._history_layout.insertWidget(self._history_layout.count() - 1, frame)
+            self._history_widgets.append(frame)
+
+    def _purge_deleted_entries(self):
+        deleted_set = {i for i, e in enumerate(self._history) if e.get("deleted")}
+        if not deleted_set:
+            return
+        for wi in range(len(self._history_widgets) - 1, -1, -1):
+            if self._render_start + wi in deleted_set:
+                w = self._history_widgets.pop(wi)
+                self._history_layout.removeWidget(w)
+                w.deleteLater()
+        removed_before = sum(1 for i in deleted_set if i < self._render_start)
+        self._history = [e for e in self._history if not e.get("deleted")]
+        self._render_start -= removed_before
+
+    def _clear_history_display(self):
+        for w in self._history_widgets:
+            self._history_layout.removeWidget(w)
+            w.deleteLater()
+        self._history_widgets.clear()
+        self._render_start = 0
+
     def _show_translating(self):
-        """Append gray italic '翻译中……' indicator before firing API request."""
-        cursor = self.fast_result.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(
-            '<br><span style="color: gray;"><i>翻译中……</i></span>'
-        )
+        """Append gray italic '翻译中……' indicator at bottom."""
+        if self._translating_label is not None:
+            self._history_layout.removeWidget(self._translating_label)
+            self._translating_label.deleteLater()
+        label = QLabel("翻译中……")
+        label.setStyleSheet("color: gray; font-style: italic;")
+        self._history_layout.insertWidget(self._history_layout.count() - 1, label)
+        self._translating_label = label
 
     def _on_selection_started(self):
-        """Append gray separator when starting a new selection after a result."""
-        if self._has_result:
-            existing = self.fast_result.toPlainText().strip()
-            if existing:
-                cursor = self.fast_result.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertHtml(
-                    '<br><span style="color: gray;">'
-                    '══════════ 以上为历史结果 ══════════'
-                    '</span>'
-                )
-            self._has_result = False
+        pass
 
     def on_pdf_selection(self, lo: int, hi: int, text: str):
         """Called by main_app when PDF text is selected (mouseup)."""
+        self.cache_hint.hide()
+        self._delete_cache_btn.setEnabled(False)
+        self._purge_deleted_entries()
+        if self._history and not self._pending_separator:
+            sep = QLabel("══════════ 以上为历史消息 ══════════")
+            sep.setStyleSheet("color: gray; font-size: 11px;")
+            sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._history_layout.insertWidget(self._history_layout.count() - 1, sep)
+            self._pending_separator = sep
         if not text or not self._current_file or self._pdf_viewer is None:
             return
 
@@ -749,7 +1021,18 @@ class ReaderTab(QWidget):
         if tgt is not None:
             self.cache_hint.setText("[短语缓存命中]")
             self.cache_hint.show()
-            self._show_result(tgt)
+            lo, hi = self._pdf_viewer.get_selection_range()
+            _lo = lo if lo is not None else -1
+            _hi = hi if hi is not None else -1
+            self._show_result(tgt, _lo, _hi)
+            if lo is not None and hi is not None:
+                self._last_cache_key = {
+                    "file_path": self._current_file,
+                    "start_idx": lo,
+                    "end_idx": hi,
+                    "is_phrase": True,
+                }
+                self._delete_cache_btn.setEnabled(True)
             return
         self.cache_hint.hide()
         if self.fast_auto_check.isChecked():
@@ -860,7 +1143,14 @@ class ReaderTab(QWidget):
             result = "".join(parts) if parts else pending["expanded_text"]
             self.cache_hint.setText("[缓存命中]")
             self.cache_hint.show()
-            self._show_result(result)
+            self._show_result(result, start_idx, end_idx)
+            self._last_cache_key = {
+                "file_path": self._current_file,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "is_phrase": False,
+            }
+            self._delete_cache_btn.setEnabled(True)
             return
 
         # ── Has gaps ────────────────────────────────────────────────
@@ -903,7 +1193,7 @@ class ReaderTab(QWidget):
         full_btn.clicked.connect(lambda: (
             dlg.accept(),
             self._do_auto_translate(
-                join_subs_for_llm(sub_sentences), pending, gap_indices, overlapping,
+                join_subs_for_llm(pending["sentences"]), pending, gap_indices, overlapping,
                 is_incremental=False,
             ),
         ))
@@ -966,7 +1256,9 @@ class ReaderTab(QWidget):
                 if gi < len(gap_tgt_parts):
                     sub_sentences[idx]["tgt"] = gap_tgt_parts[gi]
             merged = "".join(s.get("tgt", "") for s in sub_sentences)
-            self._show_result(merged)
+            self._show_result(merged,
+                              sub_sentences[0]["start_idx"],
+                              sub_sentences[-1]["end_idx"])
         else:
             # Full: replace all sub-sentence tgts
             all_tgt_parts = split_translation(data, len(sub_sentences))
@@ -974,7 +1266,17 @@ class ReaderTab(QWidget):
                 if i < len(all_tgt_parts):
                     sub_sentences[i]["tgt"] = all_tgt_parts[i]
             merged = "".join(s.get("tgt", "") for s in sub_sentences)
-            self._show_result(merged)
+            self._show_result(merged,
+                              sub_sentences[0]["start_idx"],
+                              sub_sentences[-1]["end_idx"])
+
+        self._last_cache_key = {
+            "file_path": self._current_file,
+            "start_idx": sub_sentences[0]["start_idx"],
+            "end_idx": sub_sentences[-1]["end_idx"],
+            "is_phrase": False,
+        }
+        self._delete_cache_btn.setEnabled(True)
 
         # Write cache: merge with any overlapping entries by coordinate
         if not self.cache_off_check.isChecked():
@@ -1121,7 +1423,14 @@ class ReaderTab(QWidget):
             result = "".join(parts) if parts else entry["tgt"]
             self.cache_hint.setText("[句子缓存命中]")
             self.cache_hint.show()
-            self._show_result(result)
+            self._show_result(result, start_idx, end_idx)
+            self._last_cache_key = {
+                "file_path": self._current_file,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "is_phrase": False,
+            }
+            self._delete_cache_btn.setEnabled(True)
             return
 
         self.cache_hint.hide()
@@ -1148,7 +1457,17 @@ class ReaderTab(QWidget):
             return
 
         sub_sentences = pending["sentences"]
-        self._show_result(data)
+        self._show_result(data,
+                          sub_sentences[0]["start_idx"],
+                          sub_sentences[-1]["end_idx"])
+
+        self._last_cache_key = {
+            "file_path": self._current_file,
+            "start_idx": sub_sentences[0]["start_idx"],
+            "end_idx": sub_sentences[-1]["end_idx"],
+            "is_phrase": False,
+        }
+        self._delete_cache_btn.setEnabled(True)
 
         tgt_parts = split_translation(data, len(sub_sentences))
         for i in range(len(sub_sentences)):
@@ -1237,7 +1556,10 @@ class ReaderTab(QWidget):
     def _on_fast_done(self, ok, data, cache_mode: str, sentence_meta: dict | None,
                       src: str = ""):
         if ok:
-            self._show_result(data)
+            lo, hi = self._pdf_viewer.get_selection_range()
+            _lo = lo if lo is not None else -1
+            _hi = hi if hi is not None else -1
+            self._show_result(data, _lo, _hi)
             if self._current_file and src and not self.cache_off_check.isChecked():
                 self._cache = load_cache(self._cache_path)
                 if cache_mode == "phrase":
@@ -1303,6 +1625,16 @@ class ReaderTab(QWidget):
         self._cache = cache
 
     def set_current_file(self, path: str | None):
+        self._history.clear()
+        self._clear_history_display()
+        if self._pending_separator is not None:
+            self._history_layout.removeWidget(self._pending_separator)
+            self._pending_separator.deleteLater()
+            self._pending_separator = None
+        if self._translating_label is not None:
+            self._history_layout.removeWidget(self._translating_label)
+            self._translating_label.deleteLater()
+            self._translating_label = None
         self._current_file = path
         if path:
             entry = get_or_create_pdf_history_entry(self._config, path)
@@ -1452,6 +1784,35 @@ class ReaderTab(QWidget):
         self._ensure_per_pdf_paths()
         dlg = _CacheManageDialog(self._cache_path, self)
         dlg.exec()
+
+    def _on_delete_cache(self):
+        key = self._last_cache_key
+        if not key or not self._current_file:
+            return
+        cache = load_cache(self._cache_path)
+        group = _ensure_file(cache, key["file_path"])
+        if key["is_phrase"]:
+            words = self._pdf_viewer.words
+            src = " ".join(w.text for w in words[key["start_idx"]:key["end_idx"] + 1])
+            for i, p in enumerate(group["phrases"]):
+                if p["src"] == src:
+                    group["phrases"].pop(i)
+                    break
+        else:
+            for i, entry in enumerate(group["sentences"]):
+                subs = entry.get("sentences", [])
+                if subs and subs[0]["start_idx"] <= key["start_idx"] and key["end_idx"] <= subs[-1]["end_idx"]:
+                    group["sentences"].pop(i)
+                    break
+        save_cache(cache, self._cache_path)
+        self._cache = cache
+        self._delete_cache_btn.setEnabled(False)
+        if self._history:
+            self._history[-1]["deleted"] = True
+        hint = QLabel("[缓存已删除，下次将重新翻译]")
+        hint.setStyleSheet("color: #cc6600;")
+        self._history_layout.insertWidget(self._history_layout.count() - 1, hint)
+        QTimer.singleShot(5000, hint.deleteLater)
 
     # ── File pickers ───────────────────────────────────────────────
 
@@ -1605,9 +1966,23 @@ class ReaderTab(QWidget):
         self._persist_current_paths()
 
     def _apply_result_font_size(self, size: int):
-        font = self.fast_result.font()
-        font.setPointSize(size)
-        self.fast_result.setFont(font)
+        self._result_font_size = size
+        for w in self._history_widgets:
+            self._apply_result_font_size_to_frame(w, size)
+
+    def _apply_result_font_size_to_label(self, label: QLabel):
+        font = label.font()
+        font.setPointSize(getattr(self, '_result_font_size', 14))
+        label.setFont(font)
+
+    def _apply_result_font_size_to_frame(self, frame: QFrame, size: int):
+        fl = frame.layout()
+        if fl and fl.count() >= 3:
+            content = fl.itemAt(2).widget()
+            if isinstance(content, QLabel):
+                font = content.font()
+                font.setPointSize(size)
+                content.setFont(font)
 
     def _on_result_font_changed(self, value: int):
         self._apply_result_font_size(value)

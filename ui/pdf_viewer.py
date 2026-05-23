@@ -15,12 +15,14 @@ from PySide6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsProxyWidget,
     QGraphicsRectItem,
@@ -1239,6 +1241,16 @@ class PDFViewer(QWidget):
         self._end_idx = hi
         self._draw_highlights()
 
+    def navigate_to_range(self, lo: int, hi: int):
+        self.set_highlight_range(lo, hi)
+        if self._words and lo < len(self._words):
+            w = self._words[lo]
+            rect = self._word_scene_rect(w)
+            word_scene_y = rect.center().y()
+            vp_h = self._view.viewport().height() if self._view.viewport() else 600
+            target_y = word_scene_y - vp_h / 2
+            self._view.verticalScrollBar().setValue(int(max(0, target_y)))
+
     def set_auto_complete_enabled(self, enabled: bool) -> None:
         self._auto_complete_btn.setChecked(enabled)
         self._auto_complete_btn.setText("自动句补全 ON" if enabled else "自动句补全 OFF")
@@ -1478,10 +1490,9 @@ class PDFViewer(QWidget):
         for w in selected:
             by_page.setdefault(w.page_idx, []).append(w)
 
-        pen = QPen(HIGHLIGHT_BORDER, 1.0)
-        brush = QBrush(HIGHLIGHT_COLOR)
         sf = self._scale_factor
 
+        all_rects = []
         for page_idx, page_words in by_page.items():
             off_y = self._page_offsets[page_idx]
             page_h = self._page_height_pts[page_idx]
@@ -1513,12 +1524,22 @@ class PDFViewer(QWidget):
                         (x1_pct - x0_pct) * self._available_width,
                         (y1_pct - y0_pct) * page_h * sf,
                     )
-                    item = QGraphicsRectItem(rect)
-                    item.setPen(pen)
-                    item.setBrush(brush)
-                    item.setZValue(100)
-                    self._scene.addItem(item)
-                    self._highlight_items.append(item)
+                    all_rects.append(rect)
+
+        path = QPainterPath()
+        for rect in all_rects:
+            r = QPainterPath()
+            r.addRect(rect)
+            path = path.united(r)
+
+        pen = QPen(HIGHLIGHT_BORDER, 1.0)
+        brush = QBrush(HIGHLIGHT_COLOR)
+        item = QGraphicsPathItem(path)
+        item.setPen(pen)
+        item.setBrush(brush)
+        item.setZValue(100)
+        self._scene.addItem(item)
+        self._highlight_items.append(item)
 
     # ── Framing mode mouse handlers ───────────────────────────────
 
