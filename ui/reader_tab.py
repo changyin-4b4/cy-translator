@@ -30,14 +30,12 @@ from services.cache_store import (
     add_sentence_entry,
     find_overlapping_entries,
     find_containing_entries,
-    coord_le_tolerant,
     merge_entries,
     find_mergeable_fragments,
     get_cache_summary,
     remove_file,
     auto_generate_per_pdf_path,
-    _get_group,
-    _sub_first,
+    _ensure_file,
 )
 from services.config_store import (
     save_config,
@@ -57,9 +55,9 @@ from services.sentence_analyzer import (
     classify,
     expand_to_sentence,
     is_sentence_end,
+    join_subs_for_llm,
     split_sentences,
     split_translation,
-    transform_dual_column_coords,
 )
 from services.file_writer import append_to_file, normalize_filename, write_new_file
 from services.llm_client import translate
@@ -624,46 +622,10 @@ class ReaderTab(QWidget):
 
     # ── Fast translate (from PDF selection) ────────────────────────
 
-    @property
-    def _is_dual(self) -> bool:
-        if self._pdf_viewer is None:
-            return False
-        return self._pdf_viewer.is_dual_column
-
     def inject_pdf_viewer(self, viewer) -> None:
         self._pdf_viewer = viewer
-        viewer.dual_column_toggle_requested.connect(
-            self._on_dual_column_toggle_requested)
         viewer.isolate_path_needed.connect(
             self._ensure_per_pdf_paths)
-
-    def _on_dual_column_toggle_requested(self, enabled: bool):
-        target_label = "双栏" if enabled else "单栏"
-        self._ensure_per_pdf_paths()
-        if self._current_file and self._cache_path:
-            cache = load_cache(self._cache_path)
-            group_key = "dual" if enabled else "single"
-            entry = cache.get(self._current_file, {})
-            group = entry.get(group_key, {}) if isinstance(entry, dict) else {}
-            phrases = group.get("phrases", []) if isinstance(group, dict) else []
-            sentences = group.get("sentences", []) if isinstance(group, dict) else []
-            if not phrases and not sentences:
-                reply = QMessageBox.question(
-                    self, "切换缓存模式",
-                    f"单栏与双栏cache相互独立，切换后将使用{target_label}cache，是否继续？",
-                    QMessageBox.Yes | QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    self._pdf_viewer._column_btn.setChecked(not enabled)
-                    return
-        self._pdf_viewer.set_dual_column(enabled)
-        self._persist_dual_column(enabled)
-
-    def _persist_dual_column(self, enabled: bool):
-        if self._current_file:
-            set_pdf_config_path(self._config, self._current_file,
-                                "dual_column", enabled)
-            save_config(self._config)
 
     def _show_result(self, text: str) -> None:
         self.fast_result.clear()
@@ -672,7 +634,7 @@ class ReaderTab(QWidget):
         fmt.setForeground(self.fast_result.palette().text())
         cursor.setCharFormat(fmt)
         self.fast_result.setTextCursor(cursor)
-        self.fast_result.setPlainText(text)
+        self.fast_result.setPlainText(text.replace("<br>", ""))
         self._has_result = True
         self._translating = False
 
@@ -740,8 +702,6 @@ class ReaderTab(QWidget):
             if lo is not None and hi is not None:
                 words = self._pdf_viewer.words
                 sub_sentences = split_sentences(words, lo, hi)
-                if self._pdf_viewer.is_dual_column:
-                    transform_dual_column_coords(sub_sentences)
                 word_texts = self._pdf_viewer.get_word_texts()
                 head_frag = lo == 0 or not is_sentence_end(word_texts[lo - 1])
                 tail_frag = not is_sentence_end(word_texts[hi])
@@ -785,7 +745,7 @@ class ReaderTab(QWidget):
 
         self._cache = load_cache(self._cache_path)
         tgt = lookup_phrase(self._cache, self._current_file, text,
-                             is_dual=self._is_dual)
+                             )
         if tgt is not None:
             self.cache_hint.setText("[短语缓存命中]")
             self.cache_hint.show()
@@ -817,8 +777,6 @@ class ReaderTab(QWidget):
         self._last_pdf_selection = expanded_text
 
         sub_sentences = split_sentences(words, new_lo, new_hi)
-        if self._pdf_viewer.is_dual_column:
-            transform_dual_column_coords(sub_sentences)
         for i, sub in enumerate(sub_sentences):
             sub["is_head_fragment"] = (i == 0 and expanded.head_fragment)
             sub["is_tail_fragment"] = (i == len(sub_sentences) - 1 and expanded.tail_fragment)
@@ -852,45 +810,36 @@ class ReaderTab(QWidget):
         if self.cache_off_check.isChecked():
             self.cache_hint.hide()
             self._do_auto_translate(
-                pending["expanded_text"], pending,
+                join_subs_for_llm(sub_sentences), pending,
                 list(range(len(sub_sentences))), [], is_incremental=False,
             )
             return
 
         first_sub = sub_sentences[0]
         last_sub = sub_sentences[-1]
-        sp, sy = first_sub["start_page"], first_sub["start_y_pct"]
-        ep, ey = last_sub["end_page"], last_sub["end_y_pct"]
-        sx = first_sub["start_x_pct"]
-        ex = last_sub["end_x_pct"]
+        start_idx = first_sub["start_idx"]
+        end_idx = last_sub["end_idx"]
 
         self._cache = load_cache(self._cache_path)
         overlapping = find_overlapping_entries(
-            self._cache, self._current_file, sp, sy, ep, ey,
-            is_dual=self._is_dual,
-        )
+            self._cache, self._current_file, start_idx, end_idx)
 
         # Collect all cache sub-sentences from overlapping entries
         cache_subs: list[dict] = []
         if overlapping:
-            group = _get_group(self._cache, self._current_file, self._is_dual)
+            group = _ensure_file(self._cache, self._current_file)
             for idx in overlapping:
                 entry = group["sentences"][idx]
                 for sub in entry.get("sentences", []):
                     cache_subs.append(sub)
 
-        # Detect gaps: pending sub not covered by any cache sub (strict overlap)
+        # Detect gaps: pending sub not covered by any cache sub (idx overlap)
         gap_indices: list[int] = []
         for i, psub in enumerate(sub_sentences):
             covered = False
             for csub in cache_subs:
-                if not coord_le_tolerant(
-                    csub["end_page"], csub["end_y_pct"], csub["end_x_pct"],
-                    psub["start_page"], psub["start_y_pct"], psub["start_x_pct"],
-                ) and not coord_le_tolerant(
-                    psub["end_page"], psub["end_y_pct"], psub["end_x_pct"],
-                    csub["start_page"], csub["start_y_pct"], csub["start_x_pct"],
-                ):
+                if (csub["start_idx"] <= psub["end_idx"] and
+                        csub["end_idx"] >= psub["start_idx"]):
                     covered = True
                     break
             if not covered:
@@ -898,23 +847,15 @@ class ReaderTab(QWidget):
 
         if not gap_indices:
             # ── No gaps: extract from cache ─────────────────────────
-            cache_subs.sort(key=lambda s: (
-                s["start_page"], s["start_y_pct"], s["start_x_pct"],
-            ))
+            cache_subs.sort(key=lambda s: s["start_idx"])
             parts = []
             for csub in cache_subs:
-                if not coord_le_tolerant(
-                    ep, ey, ex,
-                    csub["start_page"], csub["start_y_pct"], csub["start_x_pct"],
-                ) and not coord_le_tolerant(
-                    csub["end_page"], csub["end_y_pct"], csub["end_x_pct"],
-                    sp, sy, sx,
-                ):
+                if (csub["start_idx"] <= end_idx and
+                        csub["end_idx"] >= start_idx):
                     if csub["tgt"]:
                         parts.append(csub["tgt"])
             if overlapping:
-                merge_entries(self._cache, self._current_file, overlapping,
-                              is_dual=self._is_dual)
+                merge_entries(self._cache, self._current_file, overlapping)
                 save_cache(self._cache, self._cache_path)
             result = "".join(parts) if parts else pending["expanded_text"]
             self.cache_hint.setText("[缓存命中]")
@@ -926,11 +867,11 @@ class ReaderTab(QWidget):
         if not overlapping:
             # No cache overlap at all → full translate without dialog
             self._do_auto_translate(
-                pending["expanded_text"], pending,
+                join_subs_for_llm(sub_sentences), pending,
                 list(range(len(sub_sentences))), [], is_incremental=False,
             )
         else:
-            gap_src = " ".join(sub_sentences[i]["src"] for i in gap_indices)
+            gap_src = join_subs_for_llm([sub_sentences[i] for i in gap_indices])
             self._show_gap_dialog(gap_src, pending, gap_indices, overlapping)
 
     # ── Gap dialog ───────────────────────────────────────────────
@@ -962,7 +903,7 @@ class ReaderTab(QWidget):
         full_btn.clicked.connect(lambda: (
             dlg.accept(),
             self._do_auto_translate(
-                pending["expanded_text"], pending, gap_indices, overlapping,
+                join_subs_for_llm(sub_sentences), pending, gap_indices, overlapping,
                 is_incremental=False,
             ),
         ))
@@ -1006,7 +947,7 @@ class ReaderTab(QWidget):
             # Fill non-gap sub-sentences from cache first
             cache_subs: list[dict] = []
             if overlapping:
-                group = _get_group(self._cache, self._current_file, self._is_dual)
+                group = _ensure_file(self._cache, self._current_file)
                 for idx in overlapping:
                     entry = group["sentences"][idx]
                     for sub in entry.get("sentences", []):
@@ -1015,13 +956,8 @@ class ReaderTab(QWidget):
                 if psub_idx in gap_indices:
                     continue
                 for csub in cache_subs:
-                    if not coord_le_tolerant(
-                        csub["end_page"], csub["end_y_pct"], csub["end_x_pct"],
-                        psub["start_page"], psub["start_y_pct"], psub["start_x_pct"],
-                    ) and not coord_le_tolerant(
-                        psub["end_page"], psub["end_y_pct"], psub["end_x_pct"],
-                        csub["start_page"], csub["start_y_pct"], csub["start_x_pct"],
-                    ):
+                    if (csub["start_idx"] <= psub["end_idx"] and
+                            csub["end_idx"] >= psub["start_idx"]):
                         psub["tgt"] = csub.get("tgt", "")
                         break
             # Fill gap sub-sentences
@@ -1045,14 +981,10 @@ class ReaderTab(QWidget):
             self._write_auto_cache(pending, sub_sentences)
 
     def _write_auto_cache(self, pending: dict, sub_sentences: list[dict]):
-        first_sub = sub_sentences[0]
-        last_sub = sub_sentences[-1]
-        sp, sy = first_sub["start_page"], first_sub["start_y_pct"]
-        ep, ey = last_sub["end_page"], last_sub["end_y_pct"]
+        start_idx = sub_sentences[0]["start_idx"]
+        end_idx = sub_sentences[-1]["end_idx"]
         overlapping_now = find_overlapping_entries(
-            self._cache, self._current_file, sp, sy, ep, ey,
-            is_dual=self._is_dual,
-        )
+            self._cache, self._current_file, start_idx, end_idx)
 
         if not overlapping_now:
             new_entry = {
@@ -1063,20 +995,20 @@ class ReaderTab(QWidget):
                 "sentences": sub_sentences,
             }
             add_sentence_entry(self._cache, self._current_file, new_entry,
-                               is_dual=self._is_dual)
+                               )
         else:
-            group = _get_group(self._cache, self._current_file, self._is_dual)
+            group = _ensure_file(self._cache, self._current_file)
             merged_subs: list[dict] = []
             for idx in overlapping_now:
                 entry = group["sentences"][idx]
                 for sub in entry.get("sentences", []):
                     merged_subs.append(sub)
 
-            # Deduplicate by full start coordinate
-            seen: dict[tuple, int] = {}
+            # Deduplicate by start_idx
+            seen: dict[int, int] = {}
             deduped: list[dict] = []
             for sub in merged_subs:
-                key = (sub["start_page"], sub["start_y_pct"], sub["start_x_pct"])
+                key = sub["start_idx"]
                 if key not in seen:
                     seen[key] = len(deduped)
                     deduped.append(sub)
@@ -1087,27 +1019,17 @@ class ReaderTab(QWidget):
             for new_sub in sub_sentences:
                 replaced = False
                 for old_sub in merged_subs:
-                    if (
-                        coord_le_tolerant(
-                            new_sub["start_page"], new_sub["start_y_pct"], new_sub["start_x_pct"],
-                            old_sub["start_page"], old_sub["start_y_pct"], old_sub["start_x_pct"],
-                        ) and coord_le_tolerant(
-                            old_sub["start_page"], old_sub["start_y_pct"], old_sub["start_x_pct"],
-                            new_sub["start_page"], new_sub["start_y_pct"], new_sub["start_x_pct"],
-                        )
-                    ):
+                    if old_sub["start_idx"] == new_sub["start_idx"]:
                         old_sub["tgt"] = new_sub["tgt"]
                         replaced = True
                         break
                 if not replaced:
                     merged_subs.append(new_sub)
 
-            merged_subs.sort(key=lambda s: (
-                s["start_page"], s["start_y_pct"], s["start_x_pct"],
-            ))
+            merged_subs.sort(key=lambda s: s["start_idx"])
 
             sorted_ov = sorted(overlapping_now,
-                               key=lambda i: _sub_first(group["sentences"][i]["sentences"][0]))
+                               key=lambda i: group["sentences"][i]["sentences"][0]["start_idx"])
             first_entry = group["sentences"][sorted_ov[0]]
             last_entry = group["sentences"][sorted_ov[-1]]
             head_frag = (
@@ -1144,8 +1066,6 @@ class ReaderTab(QWidget):
         tail_frag = not is_sentence_end(word_texts[hi])
 
         sub_sentences = split_sentences(words, lo, hi)
-        if self._pdf_viewer.is_dual_column:
-            transform_dual_column_coords(sub_sentences)
         for i, sub in enumerate(sub_sentences):
             sub["is_head_fragment"] = (i == 0 and head_frag)
             sub["is_tail_fragment"] = (i == len(sub_sentences) - 1 and tail_frag)
@@ -1178,33 +1098,24 @@ class ReaderTab(QWidget):
 
         if self.cache_off_check.isChecked():
             self.cache_hint.hide()
-            src_text = " ".join(s["src"] for s in sub_sentences)
+            src_text = join_subs_for_llm(sub_sentences)
             self._do_manual_translate(src_text, pending)
             return
 
-        first_sub = sub_sentences[0]
-        last_sub = sub_sentences[-1]
-        sp, sx, sy = first_sub["start_page"], first_sub["start_x_pct"], first_sub["start_y_pct"]
-        ep, ex, ey = last_sub["end_page"], last_sub["end_x_pct"], last_sub["end_y_pct"]
+        start_idx = sub_sentences[0]["start_idx"]
+        end_idx = sub_sentences[-1]["end_idx"]
 
         self._cache = load_cache(self._cache_path)
         containing = find_containing_entries(
-            self._cache, self._current_file, sp, sy, sx, ep, ey, ex,
-            is_dual=self._is_dual,
-        )
+            self._cache, self._current_file, start_idx, end_idx)
 
         if containing:
-            group = _get_group(self._cache, self._current_file, self._is_dual)
+            group = _ensure_file(self._cache, self._current_file)
             entry = group["sentences"][containing[0]]
             parts = []
             for sub in entry.get("sentences", []):
-                if not coord_le_tolerant(
-                    ep, ey, ex,
-                    sub["start_page"], sub["start_y_pct"], sub["start_x_pct"],
-                ) and not coord_le_tolerant(
-                    sub["end_page"], sub["end_y_pct"], sub["end_x_pct"],
-                    sp, sy, sx,
-                ):
+                if (sub["start_idx"] <= end_idx and
+                        sub["end_idx"] >= start_idx):
                     if sub["tgt"]:
                         parts.append(sub["tgt"])
             result = "".join(parts) if parts else entry["tgt"]
@@ -1214,7 +1125,7 @@ class ReaderTab(QWidget):
             return
 
         self.cache_hint.hide()
-        src_text = " ".join(s["src"] for s in sub_sentences)
+        src_text = join_subs_for_llm(sub_sentences)
         self._do_manual_translate(src_text, pending)
 
     def _do_manual_translate(self, text: str, pending: dict):
@@ -1257,20 +1168,14 @@ class ReaderTab(QWidget):
 
         self._cache = load_cache(self._cache_path)
 
-        first_sub = sub_sentences[0]
-        last_sub = sub_sentences[-1]
-        sp, sy = first_sub["start_page"], first_sub["start_y_pct"]
-        ep, ey = last_sub["end_page"], last_sub["end_y_pct"]
+        start_idx = sub_sentences[0]["start_idx"]
+        end_idx = sub_sentences[-1]["end_idx"]
         overlapping = find_overlapping_entries(
-            self._cache, self._current_file, sp, sy, ep, ey,
-            is_dual=self._is_dual,
-        )
-
+            self._cache, self._current_file, start_idx, end_idx)
         if not overlapping:
-            add_sentence_entry(self._cache, self._current_file, new_entry,
-                               is_dual=self._is_dual)
+            add_sentence_entry(self._cache, self._current_file, new_entry)
         else:
-            group = _get_group(self._cache, self._current_file, self._is_dual)
+            group = _ensure_file(self._cache, self._current_file)
 
             # Collect sub-sentences from overlapping cache entries
             merged_subs: list[dict] = []
@@ -1279,28 +1184,18 @@ class ReaderTab(QWidget):
                 for sub in entry.get("sentences", []):
                     merged_subs.append(sub)
 
-            # Replace matching old subs with new subs by start coordinate
+            # Replace matching old subs with new subs by start_idx
             for new_sub in sub_sentences:
                 replaced = False
                 for old_sub in merged_subs:
-                    if (
-                        coord_le_tolerant(
-                            new_sub["start_page"], new_sub["start_y_pct"], new_sub["start_x_pct"],
-                            old_sub["start_page"], old_sub["start_y_pct"], old_sub["start_x_pct"],
-                        ) and coord_le_tolerant(
-                            old_sub["start_page"], old_sub["start_y_pct"], old_sub["start_x_pct"],
-                            new_sub["start_page"], new_sub["start_y_pct"], new_sub["start_x_pct"],
-                        )
-                    ):
+                    if old_sub["start_idx"] == new_sub["start_idx"]:
                         old_sub["tgt"] = new_sub["tgt"]
                         replaced = True
                         break
                 if not replaced:
                     merged_subs.append(new_sub)
 
-            merged_subs.sort(key=lambda s: (
-                s["start_page"], s["start_y_pct"], s["start_x_pct"],
-            ))
+            merged_subs.sort(key=lambda s: s["start_idx"])
 
             merged = {
                 "src": " ".join(s["src"] for s in merged_subs),
@@ -1347,12 +1242,12 @@ class ReaderTab(QWidget):
                 self._cache = load_cache(self._cache_path)
                 if cache_mode == "phrase":
                     add_phrase_entry(self._cache, self._current_file, src, data,
-                                     is_dual=self._is_dual)
+                                     )
                 else:
                     entry = self._build_sentence_entry(src, data, sentence_meta)
                     if entry is not None:
                         add_sentence_entry(self._cache, self._current_file, entry,
-                                           is_dual=self._is_dual)
+                                           )
                     save_cache(self._cache, self._cache_path)
                     self._fragment_self_merge()
                     return
@@ -1366,8 +1261,7 @@ class ReaderTab(QWidget):
         sub_sentences = list(meta.get("sentences", []))
         if not sub_sentences:
             sub_sentences = [{
-                "start_page": 0, "start_x_pct": 0, "start_y_pct": 0,
-                "end_page": 0, "end_x_pct": 0, "end_y_pct": 0,
+                "start_idx": 0, "end_idx": 0,
                 "src": src,
                 "tgt": tgt,
                 "is_head_fragment": False,
@@ -1400,16 +1294,13 @@ class ReaderTab(QWidget):
         changed = True
         while changed:
             changed = False
-            result = find_mergeable_fragments(cache, self._current_file,
-                                               is_dual=self._is_dual)
+            result = find_mergeable_fragments(cache, self._current_file)
             if result is not None:
                 idx_a, idx_b, _ = result
-                merge_entries(cache, self._current_file, [idx_a, idx_b],
-                              is_dual=self._is_dual)
+                merge_entries(cache, self._current_file, [idx_a, idx_b])
                 changed = True
-        if changed:
-            save_cache(cache, self._cache_path)
-            self._cache = cache
+        save_cache(cache, self._cache_path)
+        self._cache = cache
 
     def set_current_file(self, path: str | None):
         self._current_file = path
@@ -1426,18 +1317,6 @@ class ReaderTab(QWidget):
                 self._cache_path = None
                 self._cache = {"format_version": 2}
 
-            # ── Isolate file ──
-            if self._pdf_viewer is not None:
-                isolate_file = cfg.get("isolate_file")
-                if isolate_file:
-                    self._pdf_viewer.set_isolate_path(isolate_file)
-                    self._pdf_viewer.load_zones()
-                else:
-                    self._pdf_viewer.set_isolate_path(None)
-
-                # ── Dual column ──
-                dual_col = cfg.get("dual_column", False)
-                self._pdf_viewer.set_dual_column_silent(dual_col)
         else:
             self._cache_path = None
             self._cache = {}

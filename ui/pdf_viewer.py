@@ -6,7 +6,7 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 import shiboken6
-from PySide6.QtCore import QEvent, Qt, QPointF, QRectF, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QPointF, QRectF, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from page_analysis.pdf_parser import parse_pdf
+from page_analysis.xy_cut_sorter import CleanedXYCutSorter
 from services.note_store import (
     load_notes as _load_notes_from_file,
     save_notes as _save_notes_to_file,
@@ -81,6 +83,7 @@ class _Word:
     text: str
     size: float = 0.0
     flags: int = 0
+    block_id: int = 0
 
     @property
     def center_x(self) -> float:
@@ -373,8 +376,8 @@ class PDFViewer(QWidget):
     auto_complete_changed = Signal(bool)
     context_menu_requested = Signal(str)
     selection_started = Signal()  # emitted on mouse press (new selection begins)
-    dual_column_toggle_requested = Signal(bool)  # new desired state
     isolate_path_needed = Signal()  # emitted when _save_zones needs an isolate path
+    layout_path_needed = Signal()  # emitted when layout cache needs a file path
     toc_collapsed_changed = Signal(bool)
     note_path_needed = Signal()
 
@@ -389,12 +392,6 @@ class PDFViewer(QWidget):
         toolbar.setMaximumHeight(32)
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(4, 2, 4, 2)
-        self._column_btn = QPushButton("单栏模式")
-        self._column_btn.setCheckable(True)
-        self._column_btn.setFixedWidth(80)
-        self._column_btn.clicked.connect(self._toggle_column_mode)
-        tb_layout.addWidget(self._column_btn)
-
         self._auto_complete_btn = QPushButton("自动句补全 OFF")
         self._auto_complete_btn.setCheckable(True)
         self._auto_complete_btn.setToolTip("开启后自动将选中范围扩展至完整句子")
@@ -462,7 +459,6 @@ class PDFViewer(QWidget):
         self._page_height_pts: list[float] = []    # page height in PDF points
         self._scale_factor: float = 1.0             # PDF-pt → scene-px
         self._available_width: float = 800
-        self._dual_column = False
 
         self._page_items: list[QGraphicsPixmapItem] = []
         self._highlight_items: list[QGraphicsRectItem] = []
@@ -484,6 +480,7 @@ class PDFViewer(QWidget):
         self._handle_drag_idx: int = -1       # which handle is being dragged (-1 = move whole zone)
         self._zone_dragging: bool = False
         self._isolate_path: str | None = None
+        self._layout_path: str | None = None
 
         # ── Lazy render state ───────────────────────────────────────
         self._rendered_pages: dict[int, bool] = {}
@@ -527,7 +524,14 @@ class PDFViewer(QWidget):
         self._update_available_width()
         self._doc = fitz.open(path)
         self._current_file = path
-        self._render()
+        # Populate page geometry
+        for page_idx in range(len(self._doc)):
+            page = self._doc[page_idx]
+            self._page_width_pts.append(page.rect.width)
+            self._page_height_pts.append(page.rect.height)
+        # Try layout cache first, fall back to full extraction
+        loaded = self._try_load_layout_cache()
+        self._render(extract_words=(not loaded))
         self.load_zones()
         if self._zone_mode != MODE_READING:
             self._enter_mode(MODE_READING)
@@ -558,19 +562,20 @@ class PDFViewer(QWidget):
         self._active_words = None
         self._rendered_pages.clear()
         self._isolate_path = None
+        self._cached_snap_radius = None
         self._toc_panel.load_toc(None)
 
     # ── Render ─────────────────────────────────────────────────────
 
-    def _render(self):
+    def _render(self, extract_words: bool = True):
         if self._doc is None:
             return
-        self._re_render()
+        self._re_render(extract_words)
         self._load_toc()
 
-    def _re_render(self):
+    def _re_render(self, extract_words: bool = True):
         """Full render: pages + word extraction + zones."""
-        self._do_render_pages()
+        self._do_render_pages(extract_words)
 
     def _re_render_visuals(self):
         """Resize-only render: pages + zones. Skips word extraction (words are %-based)."""
@@ -644,7 +649,7 @@ class PDFViewer(QWidget):
         self._note_items.clear()
         self._note_popups.clear()
 
-        if extract_words:
+        if extract_words and not self._words:
             self._words.clear()
             self._page_width_pts.clear()
             self._page_height_pts.clear()
@@ -680,7 +685,7 @@ class PDFViewer(QWidget):
 
             offset_y += scene_h + PAGE_GAP
 
-        if extract_words:
+        if extract_words and not self._words:
             self._extract_words()
         self._render_zones()
 
@@ -804,116 +809,134 @@ class PDFViewer(QWidget):
                 return
 
     def _extract_words(self):
-        """Re-extract word list from document. Respects _dual_column ordering."""
+        """Extract words via pdf_parser + XY-Cut++, assigning global idx in reading order."""
+        if self._doc is None:
+            return
+        self._words.clear()
+
+        try:
+            pages = parse_pdf(self._current_file, _doc=self._doc)
+        except Exception:
+            self._extract_words_legacy()
+            return
+
+        sorter = CleanedXYCutSorter(norm_coords=True)
+
+        for page in pages:
+            page_idx = page["page_number"] - 1  # 1-indexed → 0-indexed
+            pw, ph = page["width"], page["height"]
+
+            while len(self._page_width_pts) <= page_idx:
+                self._page_width_pts.append(pw)
+                self._page_height_pts.append(ph)
+            self._page_width_pts[page_idx] = pw
+            self._page_height_pts[page_idx] = ph
+
+            page_words_dicts = page["words"]
+            if not page_words_dicts:
+                continue
+
+            # XY-Cut++ → reading order (each dict gets a block_id)
+            sorted_dicts = sorter.sort(page_words_dicts)
+
+            # Helper: convert pdf_parser dict → _Word
+            def _dict_to_word(wdict, bid):
+                text = wdict.get("text", "").strip()
+                if not text:
+                    return None
+                return _Word(
+                    idx=0, page_idx=page_idx,
+                    x0_pct=wdict["x0"],
+                    y0_pct=round(1.0 - wdict["y1"], 8),
+                    x1_pct=wdict["x1"],
+                    y1_pct=round(1.0 - wdict["y0"], 8),
+                    text=text,
+                    size=wdict.get("size", 0.0),
+                    flags=wdict.get("flags", 0),
+                    block_id=bid,
+                )
+
+            # Convert sorted text words
+            page_objs: list[_Word] = []
+            for wdict in sorted_dicts:
+                w = _dict_to_word(wdict, wdict.get("block_id", 0))
+                if w:
+                    page_objs.append(w)
+
+            # Convert and insert discarded noise words (one block per word)
+            noise_words = sorter.discarded_noise
+            if noise_words:
+                max_bid = max((w.block_id for w in page_objs), default=0)
+                for nw in noise_words:
+                    max_bid += 1
+                    w = _dict_to_word(nw, max_bid)
+                    if w is None:
+                        continue
+                    # Linear-scan insertion: noise count is tiny (0~5 per page)
+                    pos = 0
+                    while pos < len(page_objs):
+                        ow = page_objs[pos]
+                        if (ow.y0_pct, ow.x0_pct) > (w.y0_pct, w.x0_pct):
+                            break
+                        pos += 1
+                    page_objs.insert(pos, w)
+
+            # Local within-line x0 sort per block
+            refined: list[_Word] = []
+            i = 0
+            while i < len(page_objs):
+                run_y0 = page_objs[i].y0_pct
+                run_y1 = page_objs[i].y1_pct
+                j = i + 1
+                while j < len(page_objs):
+                    w = page_objs[j]
+                    overlap = min(w.y1_pct, run_y1) - max(w.y0_pct, run_y0)
+                    if overlap > 0:
+                        hw = w.y1_pct - w.y0_pct
+                        hr = run_y1 - run_y0
+                        if overlap >= 0.5 * min(hw, hr):
+                            run_y0 = min(run_y0, w.y0_pct)
+                            run_y1 = max(run_y1, w.y1_pct)
+                            j += 1
+                            continue
+                    break
+                run = page_objs[i:j]
+                run.sort(key=lambda w: w.x0_pct)
+                refined.extend(run)
+                i = j
+            for w in refined:
+                w.idx = len(self._words)
+                self._words.append(w)
+
+        self._rebuild_word_lists()
+        self._cached_snap_radius = None
+        self._save_layout_cache()
+
+    def _extract_words_legacy(self):
+        """Fallback: legacy PyMuPDF word extraction (no XY-Cut)."""
         self._words.clear()
         for page_idx in range(len(self._doc)):
             page = self._doc[page_idx]
             pw = self._page_width_pts[page_idx]
             ph = self._page_height_pts[page_idx]
 
-            # Build span lookup: (x0, y0) -> (size, flags) from dict extraction
-            span_info: dict[tuple[float, float], tuple[float, int]] = {}
-            dict_data = page.get_text("dict")
-            for block in dict_data.get("blocks", []):
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        bbox = span["bbox"]
-                        key = (round(bbox[0], 1), round(bbox[1], 1))
-                        span_info[key] = (span.get("size", 0.0), span.get("flags", 0))
-
             words_data = page.get_text("words")
-            page_words = []
             for w in words_data:
                 x0, y0, x1, y1 = w[:4]
                 text = w[4]
                 if not text or not text.strip():
                     continue
-
-                word_size = 0.0
-                word_flags = 0
-                if span_info:
-                    best_dist = float("inf")
-                    for (sx0, sy0), (size, flags) in span_info.items():
-                        dist = (x0 - sx0) ** 2 + (y0 - sy0) ** 2
-                        if dist < best_dist:
-                            best_dist = dist
-                            word_size = size
-                            word_flags = flags
-
                 word = _Word(
-                    idx=0,
-                    page_idx=page_idx,
-                    x0_pct=x0 / pw,
-                    y0_pct=y0 / ph,
-                    x1_pct=x1 / pw,
-                    y1_pct=y1 / ph,
+                    idx=0, page_idx=page_idx,
+                    x0_pct=x0 / pw, y0_pct=y0 / ph,
+                    x1_pct=x1 / pw, y1_pct=y1 / ph,
                     text=text,
-                    size=word_size,
-                    flags=word_flags,
                 )
-                page_words.append(word)
-
-            if self._dual_column:
-                page_words = self._reorder_dual_column(page_words, pw)
-
-            for w in page_words:
-                w.idx = len(self._words)
-                self._words.append(w)
-
+                word.idx = len(self._words)
+                self._words.append(word)
         self._rebuild_word_lists()
-
-    def _reorder_dual_column(self, page_words: list[_Word], page_width: float) -> list[_Word]:
-        """Line-level adaptive dual-column reorder.
-
-        Each line is independently judged:
-        - If any word in the line straddles the midpoint (with 1% margin),
-          the line is treated as single-column and kept in original order.
-        - Otherwise the line is split into left/right. All left words are
-          collected first, all right words second, at page end.
-        """
-        lines = self._group_words_into_lines(page_words)
-
-        result: list[_Word] = []
-        left_collected: list[_Word] = []
-        right_collected: list[_Word] = []
-
-        for line_words in lines:
-            is_single = any(
-                w.x0_pct < 0.49 and w.x1_pct > 0.51
-                for w in line_words
-            )
-            if is_single:
-                result.extend(line_words)
-            else:
-                line_left = [w for w in line_words if w.center_x < 0.5]
-                line_right = [w for w in line_words if w.center_x >= 0.5]
-                line_left.sort(key=lambda w: (w.y0_pct, w.x0_pct))
-                line_right.sort(key=lambda w: (w.y0_pct, w.x0_pct))
-                left_collected.extend(line_left)
-                right_collected.extend(line_right)
-
-        result.extend(left_collected)
-        result.extend(right_collected)
-        return result
-
-    def _toggle_column_mode(self):
-        self.dual_column_toggle_requested.emit(self._column_btn.isChecked())
-
-    def set_dual_column(self, enabled: bool):
-        self._apply_dual_column(enabled)
-
-    def set_dual_column_silent(self, enabled: bool):
-        self._column_btn.setChecked(enabled)
-        self._apply_dual_column(enabled)
-
-    def _apply_dual_column(self, enabled: bool):
-        self._dual_column = enabled
-        self._column_btn.setText("双栏模式" if self._dual_column else "单栏模式")
-        self._clear_highlights()
-        self._start_idx = -1
-        self._end_idx = -1
-        if self._doc is not None:
-            self._extract_words()
+        self._cached_snap_radius = None
+        self._save_layout_cache()
 
     def _on_auto_complete_toggled(self, checked: bool):
         self._auto_complete_btn.setText("自动句补全 ON" if checked else "自动句补全 OFF")
@@ -937,6 +960,71 @@ class PDFViewer(QWidget):
             self._zones = []
         self._rebuild_word_lists()
         self._render_zones()
+
+    def set_layout_path(self, path: str | None):
+        self._layout_path = path
+
+    def _try_load_layout_cache(self) -> bool:
+        """Try loading _words from layout cache file. Returns True on success."""
+        if not self._layout_path:
+            return False
+        p = Path(self._layout_path)
+        if not p.exists():
+            return False
+        # Check PDF modification time vs layout cache
+        pdf_mtime = os.path.getmtime(self._current_file)
+        cache_mtime = os.path.getmtime(self._layout_path)
+        if cache_mtime < pdf_mtime:
+            return False
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, list):
+            return False
+        self._words.clear()
+        for wdict in data:
+            word = _Word(
+                idx=wdict["idx"],
+                page_idx=wdict["page"],
+                x0_pct=wdict["x0"],
+                y0_pct=wdict["y0"],
+                x1_pct=wdict["x1"],
+                y1_pct=wdict["y1"],
+                text=wdict.get("text", ""),
+                size=wdict.get("size", 0.0),
+                flags=wdict.get("flags", 0),
+                block_id=wdict.get("block_id", 0),
+            )
+            self._words.append(word)
+        self._rebuild_word_lists()
+        self._cached_snap_radius = None
+        return True
+
+    def _save_layout_cache(self):
+        """Serialize _words to layout cache JSON."""
+        if not self._layout_path:
+            self.layout_path_needed.emit()
+        if not self._layout_path or not self._words:
+            return
+        data = []
+        for w in self._words:
+            data.append({
+                "idx": w.idx,
+                "page": w.page_idx,
+                "x0": round(w.x0_pct, 8),
+                "y0": round(w.y0_pct, 8),
+                "x1": round(w.x1_pct, 8),
+                "y1": round(w.y1_pct, 8),
+                "text": w.text,
+                "size": w.size,
+                "flags": w.flags,
+                "block_id": w.block_id,
+            })
+        Path(self._layout_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self._layout_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _rebuild_word_lists(self):
         """Rebuild _words_inside and _words_outside based on current _zones.
@@ -1158,10 +1246,6 @@ class PDFViewer(QWidget):
     def is_auto_complete_enabled(self) -> bool:
         return self._auto_complete_btn.isChecked()
 
-    @property
-    def is_dual_column(self) -> bool:
-        return self._dual_column
-
     # ── Coordinate mapping ─────────────────────────────────────────
 
     def _scene_to_pdf(self, pos: QPointF) -> tuple[int, float, float] | None:
@@ -1210,48 +1294,53 @@ class PDFViewer(QWidget):
 
     @staticmethod
     def _group_words_into_lines(words: list[_Word]) -> list[list[_Word]]:
-        """Group words into lines by Y proximity. Each group is one line,
-        sorted top-to-bottom; words within a line keep their original order.
+        """Group words into lines by Y-interval overlap.
+        Each group is one line, sorted top-to-bottom.
+        Uses interval overlap ≥ 50% of smaller height — handles mixed
+        font sizes (e.g. superscripts) better than point-tolerance.
         """
         if not words:
             return []
         sorted_words = sorted(words, key=lambda w: (w.y0_pct, w.x0_pct))
         lines: list[list[_Word]] = [[sorted_words[0]]]
         for w in sorted_words[1:]:
-            last_center = sum(w2.center_y for w2 in lines[-1]) / len(lines[-1])
-            if abs(w.center_y - last_center) <= PDFViewer.LINE_TOLERANCE:
-                lines[-1].append(w)
-            else:
-                lines.append([w])
+            # Union Y-interval of current line
+            line_y0 = min(w2.y0_pct for w2 in lines[-1])
+            line_y1 = max(w2.y1_pct for w2 in lines[-1])
+            overlap = min(w.y1_pct, line_y1) - max(w.y0_pct, line_y0)
+            if overlap > 0:
+                hw = w.y1_pct - w.y0_pct
+                hl = line_y1 - line_y0
+                if overlap >= 0.5 * min(hw, hl):
+                    lines[-1].append(w)
+                    continue
+            lines.append([w])
         return lines
 
     LINE_TOLERANCE = 0.005  # percentage — words within 0.5% page height belong to same line
-    BUFFER = 20             # words to expand on each side for spatial retrieval
-    SPATIAL_TOLERANCE = 0.0005  # 0.5% page height vertical tolerance
 
-    def _split_line_by_physical_column(self, line_words: list[_Word]) -> list[list[_Word]]:
-        """In dual-column mode, split a line's words into left/right groups by
-        physical x0_pct. Single-column mode returns the whole line as one group."""
-        if not self._dual_column or not line_words:
-            return [line_words] if line_words else []
-        has_straddle = any(
-            w.x0_pct < 0.49 and w.x1_pct > 0.51 for w in line_words
-        )
-        if has_straddle:
-            return [line_words]
-        left = [w for w in line_words if w.x0_pct < 0.5]
-        right = [w for w in line_words if w.x0_pct >= 0.5]
-        groups: list[list[_Word]] = []
-        if left:
-            groups.append(left)
-        if right:
-            groups.append(right)
-        return groups if groups else [line_words]
+    @property
+    def _snap_radius(self) -> float:
+        """Max corner-to-center Euclidean distance across all words.
+        Ensures the mouse snaps to a word whenever it is visually over any
+        part of that word's bounding box."""
+        if not hasattr(self, '_cached_snap_radius') or self._cached_snap_radius is None:
+            max_dist = 0.025  # fallback default
+            for w in self._words:
+                hw = w.x1_pct - w.center_x  # half-width
+                hh = w.y1_pct - w.center_y  # half-height
+                d = (hw * hw + hh * hh) ** 0.5
+                if d > max_dist:
+                    max_dist = d
+            self._cached_snap_radius = max_dist
+        return self._cached_snap_radius
 
     def _word_at_scene_pos(self, pos: QPointF) -> int | None:
-        """Return word index nearest to scene position.
-        Uses _active_words (set by _snap_start) as the candidate pool
-        so isolation zones are enforced by word-list selection, not runtime filtering.
+        """Return word index nearest to scene position by bbox distance.
+        Distance = shortest Euclidean distance from the point to the word's
+        bounding-box perimeter (0 if inside).  This handles wide words
+        correctly: a click on the left edge of a long word has dx=0 and
+        only dy matters, so a nearby short word above won't steal the snap.
         """
         if not self._active_words:
             return None
@@ -1266,40 +1355,34 @@ class PDFViewer(QWidget):
         if not candidates:
             candidates = src
 
-        # Dual-column: filter by X column first, no fallback
-        if self._dual_column:
-            if x_pct < 0.5:
-                candidates = [w for w in candidates if w.center_x < 0.5]
-            else:
-                candidates = [w for w in candidates if w.center_x >= 0.5]
-            if not candidates:
-                return None
-
         if not candidates:
             return None
 
-        # Step 1 — find reference word nearest to mouse Y
-        def _y_dist(w, y):
-            if w.y0_pct <= y <= w.y1_pct:
-                return 0.0
-            return min(abs(w.y0_pct - y), abs(w.y1_pct - y))
-
-        ref = min(candidates, key=lambda w: _y_dist(w, y_pct))
-
-        # Step 2 — collect same-line words by Y-interval overlap
-        line_words = []
+        radius = self._snap_radius
+        best = None
+        best_dist = float("inf")
         for w in candidates:
-            overlap = min(w.y1_pct, ref.y1_pct) - max(w.y0_pct, ref.y0_pct)
-            if overlap > 0:
-                hw = w.y1_pct - w.y0_pct
-                hr = ref.y1_pct - ref.y0_pct
-                if overlap >= 0.5 * min(hw, hr):
-                    line_words.append(w)
-        if not line_words:
-            line_words = [ref]
+            # horizontal distance to bbox (0 if inside x-range)
+            if x_pct < w.x0_pct:
+                dx = w.x0_pct - x_pct
+            elif x_pct > w.x1_pct:
+                dx = x_pct - w.x1_pct
+            else:
+                dx = 0.0
+            # vertical distance to bbox (0 if inside y-range)
+            if y_pct < w.y0_pct:
+                dy = w.y0_pct - y_pct
+            elif y_pct > w.y1_pct:
+                dy = y_pct - w.y1_pct
+            else:
+                dy = 0.0
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best = w
 
-        # Step 3 — nearest word in X within that line
-        best = min(line_words, key=lambda w: abs(w.center_x - x_pct))
+        if best is None or best_dist > radius:
+            return None
         return src.index(best)
 
     # ── Selection ──────────────────────────────────────────────────
@@ -1346,121 +1429,18 @@ class PDFViewer(QWidget):
 
     def _get_selected_words(self, lo: int | None = None,
                             hi: int | None = None) -> list[_Word]:
-        """Buffer-expanded spatial retrieval with logical coordinates.
-        anchor_start = press point (src[lo]), anchor_end = drag point (src[hi]).
-        Expands buffer by BUFFER around the raw range, determines first_anchor
-        and last_anchor by logical coordinate order, then applies anchor walls
-        and spatial filter before geometric reorder.
-        """
+        """Return words in [lo, hi] slice of active word list.
+        idx already reflects line-grouped + left-to-right reading order
+        from XY-Cut + per-line refinement during extraction."""
         if lo is None or hi is None:
-            lo = self._start_idx
-            hi = self._end_idx
+            lo, hi = self._start_idx, self._end_idx
         if lo is None or lo < 0 or hi is None or hi < 0:
             return []
+        # Ensure lo <= hi — backward drag produces _start_idx > _end_idx
+        if lo > hi:
+            lo, hi = hi, lo
         src = self._active_words if self._active_words is not None else self._words
-
-        # ── Logical coordinate helpers ─────────────────────────────
-        dual = self.is_dual_column
-
-        def _lx(w: _Word) -> float:
-            """Logical center X: right column shifted left by 0.5."""
-            return w.center_x - 0.5 if (dual and w.center_x >= 0.5) else w.center_x
-
-        def _ly(w: _Word) -> float:
-            """Logical Y: page * 2.0 + y0_pct, right column +1.0."""
-            base = w.y0_pct + w.page_idx * 2.0
-            return base + 1.0 if (dual and w.center_x >= 0.5) else base
-
-        def _lx0(w: _Word) -> float:
-            return w.x0_pct - 0.5 if (dual and w.center_x >= 0.5) else w.x0_pct
-
-        def _lx1(w: _Word) -> float:
-            """Logical right X: right column shifted left by 0.5."""
-            return w.x1_pct - 0.5 if (dual and w.center_x >= 0.5) else w.x1_pct
-
-        def _ly1(w: _Word) -> float:
-            """Logical Y bottom: page * 2.0 + y1_pct, right column +1.0."""
-            base = w.y1_pct + w.page_idx * 2.0
-            return base + 1.0 if (dual and w.center_x >= 0.5) else base
-
-        def _same_line(a: _Word, b: _Word) -> bool:
-            """True if logical-Y intervals overlap > 50% of the smaller height."""
-            ya0, ya1 = _ly(a), _ly1(a)
-            yb0, yb1 = _ly(b), _ly1(b)
-            overlap = min(ya1, yb1) - max(ya0, yb0)
-            if overlap <= 0:
-                return False
-            ha = ya1 - ya0
-            hb = yb1 - yb0
-            return overlap >= 0.5 * min(ha, hb)
-
-        # ── 0. Anchors: press point vs drag point ──────────────────
-        anchor_start = src[lo]
-        anchor_end = src[hi]
-
-        # Determine first/last: same-line by X, otherwise by Y-center
-        def _lcy(w: _Word) -> float:
-            return (_ly(w) + _ly1(w)) / 2
-
-        if _same_line(anchor_start, anchor_end):
-            if _lx(anchor_start) <= _lx(anchor_end):
-                first_anchor, last_anchor = anchor_start, anchor_end
-            else:
-                first_anchor, last_anchor = anchor_end, anchor_start
-        else:
-            if _lcy(anchor_start) <= _lcy(anchor_end):
-                first_anchor, last_anchor = anchor_start, anchor_end
-            else:
-                first_anchor, last_anchor = anchor_end, anchor_start
-
-        # ── 1. Buffer expansion ────────────────────────────────────
-        buf_lo = max(0, min(lo, hi) - self.BUFFER)
-        buf_hi = min(len(src), max(lo, hi) + self.BUFFER + 1)
-        candidate_words: list[_Word] = list(src[buf_lo:buf_hi])
-
-        # ── 2. Core bounding box (from two anchors) ────────────────
-        y_min = min(_ly(anchor_start), _ly(anchor_end))
-        y_max = max(_ly(anchor_start), _ly(anchor_end))
-
-        # ── 3. Anchor walls + spatial filter (logical coords) ──────
-        fa_lx = _lx0(first_anchor)
-        fa_lcy = (_ly(first_anchor) + _ly1(first_anchor)) / 2
-        la_lx = _lx1(last_anchor)
-        la_lcy = (_ly(last_anchor) + _ly1(last_anchor)) / 2
-
-        tol = self.SPATIAL_TOLERANCE
-        retrieved: list[_Word] = []
-        for w in candidate_words:
-            # Anchor walls: logical center Y hard discard, then X if same line
-            lcy = (_ly(w) + _ly1(w)) / 2
-            lx_end = _lx(w) if w is not last_anchor else la_lx + 1.0
-            lx_start = _lx0(w)
-
-            # First anchor wall: discard if clearly above, or same-line left
-            if lcy < fa_lcy - self.LINE_TOLERANCE:
-                continue
-            if _same_line(w, first_anchor) and lx_end < fa_lx:
-                continue
-
-            # Last anchor wall: discard if clearly below, or same-line right
-            if lcy > la_lcy + self.LINE_TOLERANCE:
-                continue
-            if _same_line(w, last_anchor) and lx_start > la_lx:
-                continue
-
-            # Spatial filter: soft Y boundaries from two-anchor box
-            wly = _ly(w)
-            if wly < y_min - tol or wly > y_max + tol:
-                continue
-            retrieved.append(w)
-
-        # ── 4. Geometric reorder ───────────────────────────────────
-        lines = self._group_words_into_lines(retrieved)
-        result: list[_Word] = []
-        for line_words in lines:
-            line_words.sort(key=lambda w: w.x0_pct)
-            result.extend(line_words)
-        return result
+        return list(src[lo:hi + 1])
 
     def _selected_text(self) -> str:
         words = self._get_selected_words()
@@ -1494,8 +1474,6 @@ class PDFViewer(QWidget):
         if not selected:
             return
 
-        # Group selected words by page so lines on different pages
-        # with similar center_y are never conflated.
         by_page: dict[int, list[_Word]] = {}
         for w in selected:
             by_page.setdefault(w.page_idx, []).append(w)
@@ -1517,14 +1495,17 @@ class PDFViewer(QWidget):
                 if not line_words:
                     continue
 
-                groups = self._split_line_by_physical_column(line_words)
+                # Group by block_id → separate rect per block, no cross-column stretch
+                by_block: dict[int, list[_Word]] = {}
+                for w in line_words:
+                    by_block.setdefault(w.block_id, []).append(w)
 
-                for group in groups:
-                    sorted_x = sorted(group, key=lambda w: w.x0_pct)
+                for block_words in by_block.values():
+                    sorted_x = sorted(block_words, key=lambda w: w.x0_pct)
                     x0_pct = sorted_x[0].x0_pct
                     x1_pct = sorted_x[-1].x1_pct
-                    y0_pct = min(w.y0_pct for w in group)
-                    y1_pct = max(w.y1_pct for w in group)
+                    y0_pct = min(w.y0_pct for w in block_words)
+                    y1_pct = max(w.y1_pct for w in block_words)
 
                     rect = QRectF(
                         x0_pct * self._available_width,

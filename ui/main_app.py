@@ -89,6 +89,24 @@ class _PerPdfConfigDialog(QDialog):
         self._isolate_status = QLabel("")
         layout.addWidget(self._isolate_status)
 
+        # ── Layout file row ──
+        layout_layout = QHBoxLayout()
+        layout_layout.addWidget(QLabel("版面文件:"))
+        self._layout_edit = QLineEdit()
+        self._layout_edit.setText(cfg.get("layout_file") or "")
+        layout_layout.addWidget(self._layout_edit)
+        layout_browse = QPushButton("...")
+        layout_browse.clicked.connect(
+            lambda: self._browse_file(self._layout_edit))
+        layout_layout.addWidget(layout_browse)
+        layout_clear = QPushButton("清除绑定")
+        layout_clear.clicked.connect(
+            lambda: self._reset_path(self._layout_edit))
+        layout_layout.addWidget(layout_clear)
+        layout.addLayout(layout_layout)
+        self._layout_status = QLabel("")
+        layout.addWidget(self._layout_status)
+
         # ── Note file row ──
         note_layout = QHBoxLayout()
         note_layout.addWidget(QLabel("笔记文件:"))
@@ -228,11 +246,14 @@ class _PerPdfConfigDialog(QDialog):
     def _save_and_accept(self):
         cache_val = self._cache_edit.text().strip() or None
         isolate_val = self._isolate_edit.text().strip() or None
+        layout_val = self._layout_edit.text().strip() or None
         note_val = self._note_edit.text().strip() or None
         set_pdf_config_path(self._config, self._pdf_path,
                             "cache_file", cache_val)
         set_pdf_config_path(self._config, self._pdf_path,
                             "isolate_file", isolate_val)
+        set_pdf_config_path(self._config, self._pdf_path,
+                            "layout_file", layout_val)
         set_pdf_config_path(self._config, self._pdf_path,
                             "note_file", note_val)
         save_config(self._config)
@@ -417,6 +438,7 @@ class MainApp(QWidget):
         self.pdf_viewer.selection_started.connect(self.reader_tab._on_selection_started)
         self.pdf_viewer.toc_collapsed_changed.connect(self._on_toc_collapsed_changed)
         self.pdf_viewer.note_path_needed.connect(self._ensure_note_path)
+        self.pdf_viewer.layout_path_needed.connect(self._ensure_layout_path)
 
         self.reader_tab.inject_pdf_viewer(self.pdf_viewer)
 
@@ -454,7 +476,7 @@ class MainApp(QWidget):
     def _add_pdf_history(self, path: str):
         history: list = self._config.get("pdf_history", [])
         # Inherit config from existing entry for the same path
-        old_config = {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None}
+        old_config = {"cache_file": None, "isolate_file": None, "layout_file": None, "note_file": None}
         for e in history:
             if isinstance(e, dict) and e.get("path") == path:
                 old_config = e.get("config", old_config)
@@ -477,14 +499,26 @@ class MainApp(QWidget):
         self._current_pdf = path
         self.file_label.setText(os.path.basename(path))
         self.reader_tab.set_current_file(path)
-        self.pdf_viewer.load_file(path)
-        # Restore isolate_path (cleared by _full_cleanup) and reload zones
+
+        # Ensure layout path BEFORE load_file — word extraction needs it
         entry = get_or_create_pdf_history_entry(self._config, path)
-        isolate_file = entry.get("config", {}).get("isolate_file")
+        cfg = entry.setdefault("config", {})
+        if not cfg.get("layout_file"):
+            from services.cache_store import auto_generate_per_pdf_path
+            lf = auto_generate_per_pdf_path(path, "_layout")
+            set_pdf_config_path(self._config, path, "layout_file", lf)
+            save_config(self._config)
+            cfg["layout_file"] = lf
+        self.pdf_viewer.set_layout_path(cfg.get("layout_file"))
+
+        self.pdf_viewer.load_file(path)
+
+        # Restore isolate_path (cleared by _full_cleanup) and reload zones
+        isolate_file = cfg.get("isolate_file")
         self.pdf_viewer.set_isolate_path(isolate_file)
         self.pdf_viewer.load_zones()
         # Restore note file binding
-        note_file = entry.get("config", {}).get("note_file")
+        note_file = cfg.get("note_file")
         self.pdf_viewer.set_note_path(note_file)
         self.pdf_viewer.load_notes()
 
@@ -513,6 +547,20 @@ class MainApp(QWidget):
                                "note_file", note_file)
             save_config(self._config)
             self.pdf_viewer.set_note_path(note_file)
+
+    def _ensure_layout_path(self):
+        """Auto-generate a layout cache file path for the current PDF if not set."""
+        if not self._current_pdf:
+            return
+        entry = get_or_create_pdf_history_entry(self._config, self._current_pdf)
+        cfg = entry.setdefault("config", {})
+        if not cfg.get("layout_file"):
+            from services.cache_store import auto_generate_per_pdf_path
+            layout_file = auto_generate_per_pdf_path(self._current_pdf, "_layout")
+            set_pdf_config_path(self._config, self._current_pdf,
+                               "layout_file", layout_file)
+            save_config(self._config)
+            self.pdf_viewer.set_layout_path(layout_file)
 
     def _on_pdf_context_menu(self, text):
         menu = QMenu(self)

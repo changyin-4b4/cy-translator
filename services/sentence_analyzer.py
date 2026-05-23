@@ -8,8 +8,8 @@ CHINESE_SPLITTERS = {'。', '！', '？', '.', '!', '?'}
 class ExpansionResult:
     new_lo: int
     new_hi: int
-    head_fragment: bool  # True = "残" (selection doesn't start at sentence boundary)
-    tail_fragment: bool  # True = "残" (selection doesn't end at sentence boundary)
+    head_fragment: bool
+    tail_fragment: bool
 
 
 def is_sentence_end(text: str) -> bool:
@@ -40,11 +40,10 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
     n = len(words)
     page = words[lo].page_idx
 
-    # Find word boundaries of the current page
     page_start = lo
     while page_start > 0 and words[page_start - 1].page_idx == page:
         page_start -= 1
-    # ── Baseline statistics from selection ──────────────────────────
+
     sizes = [w.size for w in words[lo:hi + 1] if w.size > 0]
     median_size = sorted(sizes)[len(sizes) // 2] if sizes else 0.0
 
@@ -57,12 +56,20 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
             gap = abs(words[i + 1].y0_pct - words[i].y0_pct)
             if gap > 0:
                 gaps.append(gap)
-    median_line_gap = sorted(gaps)[len(gaps) // 2] if gaps else 0.0
+    if gaps:
+        median_line_gap = sorted(gaps)[len(gaps) // 2]
+    else:
+        # Single-line selection (e.g. heading) — estimate from word heights
+        heights = [w.y1_pct - w.y0_pct for w in words[lo:hi + 1] if w.y1_pct > w.y0_pct]
+        if heights:
+            char_h = sorted(heights)[len(heights) // 2]
+            median_line_gap = char_h * 1.2  # line spacing ≈ 1.2× character height
+        else:
+            median_line_gap = 0.015  # hard fallback: ~1.5% page height
 
     x0_vals = [w.x0_pct for w in words[lo:hi + 1]]
     x0_median = sorted(x0_vals)[len(x0_vals) // 2] if x0_vals else 0.0
 
-    # Left scan within lo's page
     new_lo = page_start
     head_fragment = True
     for i in range(lo - 1, page_start - 1, -1):
@@ -76,7 +83,6 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
             head_fragment = False
             break
 
-    # Right scan within hi's own page
     hi_page = words[hi].page_idx
     hi_page_end = hi
     while hi_page_end < n - 1 and words[hi_page_end + 1].page_idx == hi_page:
@@ -89,6 +95,11 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
         new_hi = hi_page_end
         tail_fragment = True
         for i in range(hi + 1, hi_page_end + 1):
+            if _is_para_boundary(
+                words, i - 1, median_size, bold_ratio, median_line_gap, x0_median,
+            ):
+                new_hi = i - 1
+                break
             if is_sentence_end(words[i].text):
                 new_hi = i
                 tail_fragment = False
@@ -105,7 +116,6 @@ def expand_to_sentence(words, lo: int, hi: int) -> ExpansionResult:
 def _is_para_boundary(words, i: int, median_size: float,
                       bold_ratio: float, median_line_gap: float,
                       x0_median: float) -> bool:
-    """Check if word i is a paragraph boundary (i.e. word i+1 starts new para)."""
     w = words[i]
     if i + 1 < len(words) and words[i].page_idx == words[i + 1].page_idx and median_line_gap > 0:
         gap = abs(words[i + 1].y0_pct - words[i].y0_pct)
@@ -117,8 +127,8 @@ def _is_para_boundary(words, i: int, median_size: float,
 def split_sentences(words, lo: int, hi: int) -> list[dict]:
     """Split words[lo..hi] into individual sentences by period boundaries.
 
-    `words` is a list of objects with .text, .page_idx, .x0_pct, .y0_pct, .x1_pct, .y1_pct.
-    Returns list of sentence dicts with coordinates, src, and fragment flags.
+    `words` is a list of objects with .text, .page_idx, .x0_pct, .y0_pct, .x1_pct, .y1_pct, .idx.
+    Returns list of sentence dicts with start_idx, end_idx, src, and fragment flags.
     """
     if lo > hi:
         return []
@@ -134,52 +144,46 @@ def split_sentences(words, lo: int, hi: int) -> list[dict]:
     return sentences
 
 
-def _build_sub_entry(words, start_idx: int, end_idx: int) -> dict:
-    sw = words[start_idx]
-    ew = words[end_idx]
+def _build_sub_entry(words, start: int, end: int) -> dict:
     return {
-        "start_page": sw.page_idx,
-        "start_x_pct": sw.x0_pct,
-        "start_y_pct": sw.y0_pct,
-        "end_page": ew.page_idx,
-        "end_x_pct": ew.x1_pct,
-        "end_y_pct": ew.y0_pct,
-        "src": " ".join(words[i].text for i in range(start_idx, end_idx + 1)),
+        "start_idx": words[start].idx,
+        "end_idx": words[end].idx,
+        "src": " ".join(words[i].text for i in range(start, end + 1)),
         "tgt": "",
         "is_head_fragment": False,
         "is_tail_fragment": False,
     }
 
 
-def transform_dual_column_coords(sub_sentences: list[dict]) -> list[dict]:
-    """Shift right-column (x_pct >= 0.5) coordinates into logical space:
-    x_pct -= 0.5, y_pct += 1.0. Left-column coordinates unchanged.
-
-    After transform, left-column y stays in [0, 1), right-column y in [1, 2),
-    eliminating Y-axis overlap between the two columns.
-    """
-    for sub in sub_sentences:
-        cx = (sub["start_x_pct"] + sub["end_x_pct"]) / 2.0
-        if cx >= 0.5:
-            sub["start_x_pct"] -= 0.5
-            sub["start_y_pct"] += 1.0
-            sub["end_x_pct"] -= 0.5
-            sub["end_y_pct"] += 1.0
-    return sub_sentences
+def join_subs_for_llm(sub_sentences: list[dict]) -> str:
+    """Join sub-sentence src texts, inserting <br> at non-punctuation
+    boundaries. The LLM preserves <br> markers, giving split_translation
+    matching split points when English and Chinese sentence counts differ."""
+    parts = []
+    for i, sub in enumerate(sub_sentences):
+        src = sub["src"]
+        parts.append(src)
+        if i < len(sub_sentences) - 1:
+            stripped = src.rstrip()
+            if stripped and stripped[-1] not in SENTENCE_ENDS:
+                parts.append("<br>")
+    return " ".join(parts)
 
 
 def split_translation(translation: str, expected_count: int) -> list[str]:
-    """Split Chinese translation by sentence delimiters into expected_count pieces.
-
-    Always splits by Chinese/English periods first.
-    - Count matches → perfect 1:1 mapping.
-    - Too few pieces → pad with empty strings at the end.
-    - Too many pieces → merge excess into the last slot (joined with '。').
-    - Empty translation → returns list of empty strings.
-    """
+    """Split translation by <br> markers first, then by sentence delimiters."""
     if expected_count <= 0:
         return []
-    parts = _split_by_periods(translation.strip())
+    # Phase 1: split by <br> markers (preserved from LLM input)
+    translation = translation.replace("<br>", "\n<br>\n")
+    br_segments = [seg.strip() for seg in translation.split("\n<br>\n")]
+    # Phase 2: split each segment by periods
+    parts = []
+    for seg in br_segments:
+        if not seg:
+            continue
+        parts.extend(_split_by_periods(seg))
+    parts = [p.strip() for p in parts if p.strip()]
     if not parts:
         return [""] * expected_count
     if len(parts) == expected_count:

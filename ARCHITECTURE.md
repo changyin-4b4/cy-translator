@@ -1,90 +1,112 @@
-# CY-Translator 架构分析报告
+# CY-Translator 架构文档
 
-> 生成日期：2026-05-17
+> 生成日期：2026-05-23
 
 ***
 
-# 1. 文件结构总览
+# 1. 项目概览
+
+CY-Translator 是一个本地运行的 PDF 划词翻译工具。用户在 PDF 上划选英文文本，工具调用 OpenAI 兼容 API（DeepSeek、OpenAI、本地模型等）将选中内容翻译为中文。
+
+***
+
+# 2. 文件结构总览
 
 ## 入口
 
-| 文件        | 职责                           |
-| --------- | ---------------------------- |
+| 文件 | 职责 |
+| --- | --- |
 | `main.py` | 应用程序入口，设置 Qt 环境变量，启动 MainApp |
 
 ## UI 层 (`ui/`)
 
-| 文件                 | 职责                                                       |
-| ------------------ | -------------------------------------------------------- |
-| `ui/main_app.py`   | 顶层工作区：PDF 查看器 + 右侧面板的水平分割布局，管理 PDF 打开历史和信号路由             |
-| `ui/pdf_viewer.py` | **核心模块**：PDF 渲染、\_Word 提取、划词选择引擎、隔离域管理、笔记系统、TOC 目录面板     |
-| `ui/reader_tab.py` | **右侧控制面板**：翻译触发逻辑、缓存查找/写入、句补全两阶段流程、LLM 调用调度，以及 URL 管理对话框 |
+| 文件 | 职责 |
+| --- | --- |
+| `ui/main_app.py` | 顶层工作区：PDF 查看器 + 右侧面板的水平分割布局，管理 PDF 打开历史、per-PDF 配置文件对话框、信号路由 |
+| `ui/pdf_viewer.py` | **核心模块**：PDF 渲染（懒加载 + 后台预渲染）、_Word 提取（通过 page_analysis 管线）、划词选择引擎、隔离域管理（框选/管理/扩散至全文）、笔记系统、TOC 目录面板、高亮渲染 |
+| `ui/reader_tab.py` | **右侧控制面板**：两栏翻译模式（划词速翻 / 翻译持久化）、URL/Key/Model 管理、缓存查找与写入、句补全两阶段流程、LLM 调用调度、Prompt 文件管理 |
+
+## 版面分析管线 (`page_analysis/`)
+
+| 文件 | 职责 |
+| --- | --- |
+| `page_analysis/schema.py` | 数据契约定义：word 和 page 的标准 dict 格式，坐标归一化约定（底部原点，0–1 范围） |
+| `page_analysis/pdf_parser.py` | PDF 解析入口：PyMuPDF 文本提取 + Tesseract OCR 回退 + 坐标归一化 |
+| `page_analysis/xy_cut_sorter.py` | **XY-Cut++ 递归投影分割**：扫描线算法、邻居启发式孤立检测、动态阻塞清理、block_id 追踪 |
+| `page_analysis/post_merge_indexer.py` | 后处理：噪声词块化、页码分组 Z-sort、全局索引注入 |
+| `page_analysis/evaluate.py` | 版面分析评估工具 |
+| `page_analysis/test_pdf_parser.py` | pdf_parser 单元测试 |
+| `page_analysis/test_post_merge_indexer.py` | post_merge_indexer 单元测试 |
 
 ## 服务层 (`services/`)
 
-| 文件                              | 职责                                            |
-| ------------------------------- | --------------------------------------------- |
-| `services/cache_store.py`       | 翻译缓存持久化：双层短语/句子缓存、坐标匹配、条目合并、残句自整理             |
-| `services/sentence_analyzer.py` | 句子分析：句末检测、句补全扩展、句子切分、译文拆分、双栏坐标变换              |
-| `services/note_store.py`        | 笔记持久化：加载/保存笔记 JSON 文件                         |
-| `services/config_store.py`      | 全局配置持久化：URL/Key/Model 管理、Prompt 文件列表、PDF 历史记录 |
-| `services/file_writer.py`       | 翻译结果写文件：新建/追加 Markdown 文件                     |
-| `services/llm_client.py`        | LLM API 客户端：通过 `/v1/chat/completions` 端点调用翻译  |
-| `services/model_fetcher.py`     | 模型列表获取：通过 `/v1/models` 端点拉取可用模型               |
-| `services/prompt_loader.py`     | 系统提示词加载：从 .txt 文件读取 prompt 内容                 |
+| 文件 | 职责 |
+| --- | --- |
+| `services/cache_store.py` | 翻译缓存持久化：扁平 phrase/sentence 结构、idx 匹配、条目合并、残句自整理、format_version=3 |
+| `services/sentence_analyzer.py` | 句子分析：句末检测、句补全扩展、句子切分、`<br>` 标记拼接与拆分、段落边界检测 |
+| `services/note_store.py` | 笔记持久化：加载/保存笔记 JSON 文件 |
+| `services/config_store.py` | 全局配置持久化：URL/Key/Model 管理、Prompt 文件列表、PDF 历史记录（含 per-PDF 配置路径） |
+| `services/file_writer.py` | 翻译结果写文件：新建/追加 Markdown 文件 |
+| `services/llm_client.py` | LLM API 客户端：通过 `/v1/chat/completions` 端点调用翻译 |
+| `services/model_fetcher.py` | 模型列表获取：通过 `/v1/models` 端点拉取可用模型 |
+| `services/prompt_loader.py` | 系统提示词加载：从 .txt 文件读取 prompt 内容 |
 
 ## 工具层 (`utils/`)
 
-| 文件                       | 职责                       |
-| ------------------------ | ------------------------ |
+| 文件 | 职责 |
+| --- | --- |
 | `utils/paste_cleaner.py` | 粘贴文本清洗：去除 PDF 复制产生的多余换行符 |
 
-## 配置与提示词
+## 配置与发布
 
-| 文件                        | 职责                                   |
-| ------------------------- | ------------------------------------ |
-| `config.json`             | 全局配置文件（URL、Key、模型、提示词历史、PDF 历史、窗口尺寸） |
-| `prompt.txt`              | 默认翻译提示词（纯文本输出）                       |
-| `prompt_for_markdown.txt` | Markdown 格式翻译提示词                     |
-| `requirements.txt`        | Python 依赖：PySide6、PyMuPDF、requests   |
+| 文件 | 职责 |
+| --- | --- |
+| `config.json` | 全局配置文件（URL、Key、模型、提示词历史、PDF 历史、窗口尺寸、per-PDF 配置） |
+| `prompt.txt` | 默认翻译提示词（纯文本输出） |
+| `prompt_for_markdown.txt` | Markdown 格式翻译提示词 |
+| `requirements.txt` | Python 依赖：PySide6、PyMuPDF、requests |
+| `build_release.py` | PyInstaller 打包与发布脚本 |
 
 ***
 
-# 2. 核心数据结构
+# 3. 核心数据结构
 
-## 2.1 \_Word 对象
+## 3.1 _Word 对象
 
-**定义位置：** `ui/pdf_viewer.py:72-91`，`@dataclass`
+**定义位置**：`ui/pdf_viewer.py`，`@dataclass`
 
 ```python
 @dataclass
 class _Word:
-    idx: int          # 在全局 _words 列表中的索引，每次 _extract_words() 重新分配
+    idx: int          # 全局阅读顺序索引（由 XY-Cut + 后处理分配）
     page_idx: int     # 所属页码（0-based）
-    x0_pct: float     # 左边界百分比坐标 (0.0 ~ 1.0)
-    y0_pct: float     # 上边界百分比坐标 (0.0 ~ 1.0)
+    x0_pct: float     # 左边界百分比坐标 (0.0 ~ 1.0)，PDF 底部原点
+    y0_pct: float     # 下边界百分比坐标 (0.0 ~ 1.0)
     x1_pct: float     # 右边界百分比坐标 (0.0 ~ 1.0)
-    y1_pct: float     # 下边界百分比坐标 (0.0 ~ 1.0)
+    y1_pct: float     # 上边界百分比坐标 (0.0 ~ 1.0)
     text: str         # 单词文本
-    size: float       # 字号（来自 span 字典），0.0 表示未知
-    flags: int        # 字体标记（来自 span 字典），bit 4 (16) 表示粗体
+    size: float = 0.0  # 字号（来自 span 字典），0.0 表示未知
+    flags: int = 0     # 字体标记，bit 4 (16) 表示粗体
+    block_id: int = 0  # XY-Cut 叶子块 ID，用于高亮隔断和缓存键
 ```
 
-**坐标系**：百分比坐标，以页面宽高为分母。`center_x` 和 `center_y` 是计算属性，返回 bbox 几何中心。
+**坐标系**：百分比坐标，以页面宽高为分母，PDF 标准底部原点（Y 轴向上）。`center_x` 和 `center_y` 是计算属性。
 
-**双栏变换**：\_Word 的百分比坐标始终存储为**物理坐标**（即 PDF 原始布局）。双栏逻辑变换在**使用处**进行（见 `_lx()`, `_ly()` 等 helper 函数），不修改 \_Word 本身。
+**idx 的语义**：`idx` 表示该词在整个文档中的全局阅读顺序。由 XY-Cut 递归投影分割确定块级顺序，再经页面内 Z-sort（上→下、左→右）和全局索引注入得到。**不再使用 PDF 原始字符流顺序**。
+
+**block_id 的语义**：每个 XY-Cut 叶子块获得唯一递增的 `block_id`。同一块内的词属于同一视觉段落/列。用于高亮渲染时按块隔断（避免跨栏大矩形）。
+
+**坐标存储**：_Word 始终存储物理百分比坐标（PDF 原始布局）。不再有双栏逻辑坐标变换——XY-Cut 已经在提取阶段按阅读顺序重排了词序。
 
 **生命周期**：
+1. `_extract_words()` 调用 `page_analysis` 管线创建所有 _Word 对象
+2. 每次打开新 PDF 时重建
+3. 若存在有效的布局缓存文件则从缓存加载（跳过重新解析）
+4. 窗口 resize 不重建（百分比坐标与渲染分辨率无关）
 
-1. `_extract_words()` 创建所有 \_Word 对象 → 存入 `self._words` 列表
-2. 每次切换单/双栏或打开新 PDF 时重建
-3. 窗口 resize 不会重建（因为坐标是百分比，与渲染分辨率无关）
+## 3.2 _Zone（隔离域）
 
-## 2.2 \_Zone（隔离域）
-
-**定义位置：** 存储为 `dict`，无显式 dataclass。
-
-**字段：**
+**存储**：`self._zones: list[dict]`，每个 dict 的坐标是物理百分比坐标。
 
 ```python
 {
@@ -96,32 +118,32 @@ class _Word:
 }
 ```
 
-**存储**：`self._zones: list[dict]`（物理百分比坐标，与 scene 坐标通过 `_zone_scene_rect()` / `_scene_rect_to_zone()` 互转）。
-
-**持久化**：JSON 数组，直接序列化到 `_isolate` 文件。
+**持久化**：JSON 数组，序列化到 `{pdf名}_isolate_{时间戳}.json` 文件。
 
 **生命周期**：
-
 1. 加载 PDF 时从 isolate 文件读入
 2. 用户框选时追加
-3. 管理模式下可拖动/删除
-4. 每次变更后自动保存到文件
+3. 管理模式下可拖动/调整大小/删除
+4. 支持"扩散至全文"：将同一区域复制到所有页面（用于页眉、页脚、页码）
+5. 每次变更后自动保存到文件
 
-## 2.3 Cache 条目
+## 3.3 Cache 条目
 
-**定义位置：** `services/cache_store.py`
+**定义位置**：`services/cache_store.py`
 
-**顶层结构：**
+**顶层结构（format_version=3）**：
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 3,
   "<pdf_absolute_path>": {
-    "single": { "phrases": [...], "sentences": [...] },
-    "dual":   { "phrases": [...], "sentences": [...] }
+    "phrases": [...],
+    "sentences": [...]
   }
 }
 ```
+
+**关键变化**：不再有 `single`/`dual` 分组——XY-Cut 自动处理所有排版，无需手动切换。结构完全扁平化。
 
 ### Phrase 条目
 
@@ -132,7 +154,7 @@ class _Word:
 }
 ```
 
-按 `src` 精确匹配，用于短词组（≤5 词且无句末标点）。
+按 `src` 精确字符串匹配，用于短词组（≤5 词且无句末标点）。
 
 ### Sentence 条目
 
@@ -144,8 +166,8 @@ class _Word:
   "tail_fragment": false,
   "sentences": [
     {
-      "start_page": 8, "start_x_pct": 0.146, "start_y_pct": 0.849,
-      "end_page": 8,   "end_x_pct": 0.454,   "end_y_pct": 0.869,
+      "start_idx": 142,
+      "end_idx": 156,
       "src": "子句原文",
       "tgt": "子句译文",
       "is_head_fragment": true,
@@ -155,13 +177,11 @@ class _Word:
 }
 ```
 
-**sub 条目**: 每个 sub 是一个子句，包含起止坐标、原文、译文、以及 `is_head_fragment` / `is_tail_fragment` 标记（表示该子句是否为残句的首/尾）。
+**关键变化**：sub 条目不再存储坐标字段（`start_page`, `start_x_pct`, `start_y_pct`, `end_page`, `end_x_pct`, `end_y_pct`），改为存储 `start_idx` / `end_idx`（全局词索引）。这彻底消除了坐标容差问题和双栏/单栏坐标空间不一致问题。
 
-## 2.4 Notes 条目
+## 3.4 Notes 条目
 
-**定义位置：** `services/note_store.py`
-
-**存储结构：**
+**定义位置**：`services/note_store.py`
 
 ```json
 {
@@ -179,597 +199,370 @@ class _Word:
 }
 ```
 
-**字段含义：**
+## 3.5 布局缓存
 
-- `page`: 所在页码（0-based）
-- `x_pct`, `y_pct`: 笔记图标左上角的百分比坐标
-- `text`: 笔记文本内容（纯文本）
-- `width`, `height`: 弹出编辑器的尺寸（像素，在 scene 坐标系中）
+**定义位置**：`pdf_viewer.py:_save_layout_cache()` / `_try_load_layout_cache()`
+
+```json
+[
+  {
+    "idx": 0,
+    "page": 0,
+    "x0": 0.12345678,
+    "y0": 0.87654321,
+    "x1": 0.14567890,
+    "y1": 0.89012345,
+    "text": "word",
+    "size": 10.0,
+    "flags": 0,
+    "block_id": 3
+  }
+]
+```
+
+**用途**：首次解析 PDF 后，将完整的 `_words` 列表序列化保存。再次打开时，如果 PDF 修改时间未变，直接从布局缓存加载，跳过 XY-Cut 重新解析（节省 2–10 秒）。
 
 ***
 
-# 3. 核心模块详细分析
+# 4. 核心模块详细分析
 
-## 3.1 PDF 解析与坐标系
+## 4.1 PDF 解析管线
 
-### PyMuPDF 原始数据如何提取为 \_Word 对象
-
-**位置：** `pdf_viewer.py:_extract_words()` (line 805-862)
-
-流程：
+### 数据流
 
 ```
-page.get_text("dict") → 提取 span 信息 (size, flags)
-         │
-         ▼
-page.get_text("words") → [(x0, y0, x1, y1, text, ...), ...]
-         │
-         ▼
-  坐标归一化: x_pct = x / page_width, y_pct = y / page_height
-         │
-         ▼
-  构造 _Word(idx, page_idx, x0_pct, y0_pct, x1_pct, y1_pct, text, size, flags)
-         │
-         ▼
-  如果双栏模式: _reorder_dual_column() 重排 → 重新分配 idx
+fitz.open(path) → parse_pdf() → 每页:
+  ├─ _text_extract_words(): PyMuPDF get_text("words")
+  │    → 原始词列表（top-left 坐标）
+  ├─ 或 _ocr_extract_words(): Tesseract OCR 回退
+  │    → 原始词列表（top-left 坐标）
+  └─ _normalize_page():
+       ├─ 坐标翻转：y0 = ph - y1, y1 = ph - y0（top-left → bottom-left）
+       └─ 归一化：x /= pw, y /= ph → (0–1 范围)
+           → 标准 page dict {page_number, width, height, words}
 ```
 
-span 信息通过 `(x0, y0)` 最近邻匹配关联到对应 word，提供字号和粗体标记。
+然后：
 
-### 百分比坐标系的定义和换算
+```
+page dicts → CleanedXYCutSorter.sort() → 递归投影分割:
+  ├─ 扫描线算法查找最佳切割线（V-cut / H-cut）
+  ├─ 邻居启发式孤立检测：孤立词 → discarded_noise
+  └─ 递归分割直到不可再分 → 每块内按 y↓ x→ 排序
+       → 每个词获得 block_id
 
-- **百分比坐标 = 物理位置 / 页面尺寸**，值域 \[0, 1]
-- **坐标存储**：`_Word` 的 `x0_pct` / `y0_pct` / `x1_pct` / `y1_pct` 存储百分比坐标
-- **zone** 也存储百分比坐标
-- **cache sub 条目** 存储百分比坐标（双栏模式下，是变换后的逻辑坐标）
+sorted words → pdf_viewer._extract_words():
+  ├─ 转换 dict → _Word 对象
+  ├─ 噪声词线性扫描插入正确位置
+  ├─ 每块内同行按 x0_pct 精排
+  └─ 分配全局 idx
+```
 
-**Scene 坐标换算**（`pdf_viewer.py`）：
+### OCR 回退策略
 
+`pdf_parser.py` 支持两阶段提取：
+1. **文本提取优先**：`page.get_text("words")` 获取 PyMuPDF 原生文字层
+2. **OCR 回退**：如果某页提取到的词数 < `text_min_words`（默认 5），自动调用 Tesseract OCR（通过 `page.get_textpage_ocr()`）
+
+OCR 引擎可通过替换 `_ocr_extract_words()` 函数进行热插拔（详见 schema.py 的合约规范）。
+
+### 坐标归一化
+
+- PyMuPDF 原始坐标：top-left 原点，Y 轴向下
+- 归一化后坐标：bottom-left 原点（PDF 标准），Y 轴向上，值域 [0, 1]
+- 翻转公式：`new_y0 = 1.0 - old_y1`, `new_y1 = 1.0 - old_y0`
+
+在 `pdf_viewer._extract_words()` 中转换为 _Word 时再次翻转以适配 UI 坐标（顶部原点，Y 向下）：
 ```python
-# 百分比 → scene
-scene_x = word.x0_pct * available_width
-scene_y = page_offset_y + word.y0_pct * page_height_pts * scale_factor
-
-# scene → 百分比（_scene_to_pdf）
-x_pct = scene_x / available_width
-y_pct = (scene_y - page_offset_y) / (page_height_pts * scale_factor)
+y0_pct = round(1.0 - wdict["y1"], 8)
+y1_pct = round(1.0 - wdict["y0"], 8)
 ```
 
-### 双栏模式下逻辑坐标的变换规则
+## 4.2 XY-Cut++ 递归投影分割
 
-**变换时机**：仅在**使用处**进行，不修改原始数据。
+**位置**：`page_analysis/xy_cut_sorter.py`
 
-**变换公式**（`pdf_viewer.py:_get_selected_words()` 内部 helper）：
+### 算法概述
 
-```python
-# 逻辑 center X: 右栏单词 x 坐标左移 0.5
-def _lx(w): return w.center_x - 0.5 if (dual and w.center_x >= 0.5) else w.center_x
+XY-Cut++ 是经典递归投影分割（Recursive XY-Cut）的增强版，核心改进：
 
-# 逻辑 Y: page * 2.0 + y0_pct, 右栏 +1.0
-def _ly(w):
-    base = w.y0_pct + w.page_idx * 2.0
-    return base + 1.0 if (dual and w.center_x >= 0.5) else base
-```
+1. **扫描线算法**（O(n log n)）：通过排序事件点 + 扫描线找最佳空白间隙，替代 O(n²) 候选扫描
+2. **邻居启发式孤立检测**：识别周围无相邻元素的孤立词（页眉、页脚、页码），自动丢弃并在最终排序后回注
+3. **动态阈值**：根据词宽/词高中位数自适应计算切割阈值
+4. **block_id 追踪**：每个叶子块分配唯一递增 ID
 
-**语义**：将双栏 PDF 的右栏映射到"逻辑坐标空间"，消除左右栏之间的 Y 轴重叠。变换后：
-
-- 左栏词：Y 范围 `[page*2, page*2+1)`
-- 右栏词：Y 范围 `[page*2+1, page*2+2)`
-- 左右栏在逻辑空间中垂直分离，不会相互干扰
-
-**cache 中的变换**：`sentence_analyzer.py:transform_dual_column_coords()` 对 sub\_sentence 的坐标做同样变换后再写入缓存，确保缓存中的坐标与划词逻辑坐标一致。
-
-**何时变换**：
-
-- 划词选择（`_get_selected_words`）：总是使用逻辑坐标进行过滤
-- 缓存匹配（`find_overlapping_entries` / `find_containing_entries`）：使用已变换后的坐标（因为写入缓存前已变换）
-- 视觉渲染高亮（`_draw_highlights`）：使用物理坐标（因为渲染需要真实位置）
-- 隔离域：使用物理坐标
-
-### page\_offsets 的作用和计算方式
-
-**定义**：`self._page_offsets: list[float]`，每个页面左上角在 `QGraphicsScene` 中的 Y 坐标。
-
-**计算**（`_do_render_pages()`）：
-
-```python
-offset_y = 0.0
-for page_idx in range(total_pages):
-    ph = page.rect.height           # PDF points
-    sf = available_width / ph       # scale factor
-    scene_h = ph * sf                # page height in scene pixels
-    page_offsets.append(offset_y)
-    offset_y += scene_h + PAGE_GAP   # PAGE_GAP = 16
-```
-
-**用途**：
-
-1. 将百分比坐标转换为 scene 坐标（Y 轴加 offset）
-2. 确定鼠标点击落在哪个页面
-3. 页面导航时的目标位置计算
-
-## 3.2 划词引擎
-
-### \_snap\_start / \_snap\_end 的工作流程
-
-**`_snap_start(pos)`** (line 1306)：
+### 工作流程
 
 ```
-1. 如果处于阅读模式且有隔离域
-   → 判断鼠标是否在某个 zone 内
-   → 在 zone 内 → _active_words = _words_inside
-   → 在 zone 外 → _active_words = _words_outside
-2. 否则 _active_words = _words（全部词）
-3. 调用 _word_at_scene_pos(pos) 找到最近的词索引 → _start_idx
+recursive_segment(objects):
+  1. if len(objects) <= 1 → 分配 block_id，返回
+  2. find_best_cuts() → 扫描线找最佳 V-cut 和 H-cut
+  3. 如果存在干净切割（gap >= threshold）：
+     - V-cut vs H-cut：选 gap 更大的
+     - 递归分割两个子组
+  4. 如果切割被 ≤2 个桥接词阻塞：
+     - 检查桥接词是否孤立（is_isolated）
+     - 全部孤立 → 丢弃桥接词，递归分割剩余词
+  5. 无法分割 → 组内按 y↓ x→ 排序，分配 block_id，返回
 ```
 
-**`_snap_end(pos)`** (line 1327)：
+### 孤立检测算法
+
+`is_isolated(target, all_objects, h_thresh, v_thresh)`：
+
+- 检查 target 在四个方向（上下左右）是否有邻居
+- 邻居定义：投影重叠 + 间距 ≤ 阈值
+- 如果邻居方向数 < 2 → 判定为孤立（丢弃）
+
+此机制自动过滤页眉、页脚、页码等与正文排版空间隔离的元素。
+
+### 归一化坐标阈值
+
+| 参数 | 值 | 用途 |
+|------|-----|------|
+| `_NORM_V_GAP` | 0.010 (1.0% 页宽) | 垂直切割（列分割）最小间隙 |
+| `_NORM_H_GAP` | 0.005 (0.5% 页高) | 水平切割（段分割）最小间隙 |
+| `MAX_BRIDGE_COUNT` | 2 | 最多允许的桥接词数 |
+
+## 4.3 划词引擎
+
+### _word_at_scene_pos 的命中算法
+
+**位置**：`pdf_viewer.py:_word_at_scene_pos()`
+
+采用**点到矩形 bbox 最短距离**算法：
 
 ```
-1. 调用 _word_at_scene_pos(pos) 找到最近的词索引 → _end_idx
+1. scene_pos → PDF 百分比坐标 (_scene_to_pdf)
+2. 候选池 = _active_words，优先同页词
+3. 对每个候选词，计算点到 bbox 的欧氏距离：
+   - 点在 bbox 内 → dx=0, dy=0 → dist=0（绝对优先）
+   - 点在 bbox 外 → 只计超出 x/y 范围的偏移分量
+4. 返回距离最小的词的索引
+5. 如果最小距离 > snap_radius → 返回 None（未命中）
 ```
 
-### \_word\_at\_scene\_pos 的命中算法
+**snap_radius**：动态计算 = 全 PDF 最大词的角-中心欧氏距离。确保鼠标只要在词的 bbox 上方就能吸附，而宽词的边缘不会被邻近的短词"劫走"。
 
-**位置**：`pdf_viewer.py:1250-1302`
+### _get_selected_words 的流程
 
-```
-Step 0: 候选池 = _active_words（由 _snap_start 锁定）
-Step 1: scene_pos → PDF 百分比坐标 (_scene_to_pdf)
-Step 2: 过滤候选池为同页词（如果没有则保留全部候选）
-Step 3: 双栏模式下，按鼠标 X 坐标过滤左右栏
-Step 4: 找与鼠标 Y 最近邻的词作为 ref（Y 轴区间距离）
-Step 5: 收集与 ref 同行（Y 区间重叠度 ≥ 50%）的词
-Step 6: 在同行词中找 X 最近邻 → 返回其索引
-```
+**位置**：`pdf_viewer.py:_get_selected_words()`
 
-**同行判断（Step 5）**：使用 Y 轴区间重叠度算法，而非单点容差。条件是 `overlap >= 0.5 * min(height_a, height_b)`。
-
-### \_get\_selected\_words 的完整流程
-
-**位置**：`pdf_viewer.py:1346-1462`
-
-这是划词引擎的核心函数，负责从两个锚点确定完整的选中词集合。
+由于 XY-Cut 已将词按阅读顺序排列且 idx 即全局阅读顺序，划词选择变得简单直接：
 
 ```
-0. 锚点确定
-   anchor_start = src[lo], anchor_end = src[hi]
-   如果同行 → 按逻辑 X 排序确定 first/last
-   如果跨行 → 按逻辑 Y center 排序确定 first/last
-
-1. 缓冲池构建
-   在 src 数组中，以 [lo, hi] 为中心向两侧各扩展 BUFFER(=20) 个词
-   → candidate_words = src[buf_lo : buf_hi]
-
-2. 锚点墙过滤（使用逻辑坐标）
-   对于候选池中的每个词 w：
-   ┌─ First anchor wall ─────────────────────────────
-   │ 如果 w 的逻辑 Y center < first_anchor 的逻辑 Y center - LINE_TOLERANCE
-   │   → 丢弃（w 在 first_anchor 上方太远）
-   │ 如果 w 与 first_anchor 同行 且 w 的逻辑右边界 < first_anchor 的逻辑左边界
-   │   → 丢弃（w 在 first_anchor 左侧）
-   ├─ Last anchor wall ──────────────────────────────
-   │ 如果 w 的逻辑 Y center > last_anchor 的逻辑 Y center + LINE_TOLERANCE
-   │   → 丢弃（w 在 last_anchor 下方太远）
-   │ 如果 w 与 last_anchor 同行 且 w 的逻辑左边界 > last_anchor 的逻辑右边界
-   │   → 丢弃（w 在 last_anchor 右侧）
-   └─ Spatial filter ────────────────────────────────
-     如果 w 的逻辑 Y 不在 [y_min - tol, y_max + tol]
-       → 丢弃
-
-3. 几何重排
-   对通过的词进行 _group_words_into_lines() 分行
-   → 每行内按 x0_pct 排序
-   → 拼接为最终结果
+1. 确定 lo = min(start_idx, end_idx), hi = max(start_idx, end_idx)
+2. 从 _active_words 中取 src[lo:hi+1] 切片
+3. 返回切片中的所有词
 ```
 
-### 为什么需要几何重排
+**关键简化**：不再需要锚点墙过滤、缓冲池扩展、几何重排——这些都由 XY-Cut 在提取阶段一劳永逸地解决了。`_get_selected_words` 现在只做索引切片，O(1) 复杂度。
 
-PDF 字符流顺序可能不是视觉阅读顺序（例如双栏 PDF 的右栏词在字符流中出现在左栏词之后；数学公式中的上下标可能以非视觉顺序出现）。几何重排确保最终输出文本的单词顺序与屏幕上看到的顺序一致。
+### 行分组算法（_group_words_into_lines）
 
-### 同行判断算法
+**位置**：`pdf_viewer.py:_group_words_into_lines()`
 
-此处使用 `_same_line()` 函数，基于逻辑坐标的 Y 轴区间重叠度：
+采用 **Y 区间重叠度算法**（替代旧版的单点容差）：
 
-- 计算两个词在逻辑 Y 轴的区间重叠长度
-- 判定条件：`overlap >= 0.5 * min(height_a, height_b)`
-- 这是**区间重叠度**算法（不是单点容差），能正确处理不同字号的词
-
-## 3.3 隔离域
-
-### zones 的数据存储
-
-**内存**：`self._zones: list[dict]`，每个 dict 的坐标是**物理百分比坐标**（不使用双栏逻辑变换）。
-
-**文件**：JSON 数组，与内存结构一致。
-
-### \_rebuild\_word\_lists 的预计算逻辑
-
-**位置**：`pdf_viewer.py:940-962`
-
-```python
-def _rebuild_word_lists(self):
-    遍历所有 _words:
-      如果 word 的 bbox 完全被某个 zone 包含
-        → 加入 _words_inside
-      否则
-        → 加入 _words_outside
+```
+overlap = min(w.y1_pct, line_y1) - max(w.y0_pct, line_y0)
+if overlap > 0:
+    if overlap >= 0.5 * min(word_height, line_height):
+        → 同一行
+    else:
+        → 新行
 ```
 
-**判定条件**：`word.page_idx == zone.page` 且 `word.x0_pct >= zone.x0` 且 `word.x1_pct <= zone.x1` 且 `word.y0_pct >= zone.y0` 且 `word.y1_pct <= zone.y1`
+此算法正确处理混合字号场景（上下标、公式元素），因为两个词的 Y 区间只要有 ≥50% 的重叠即判定为同行，不依赖 center_y 的单点比较。
 
-即：完全包含判定（所有四个边界都在 zone 内部）。
+## 4.4 隔离域系统
+
+### _rebuild_word_lists 的预计算
+
+**判定条件**：一个词属于某个 zone 当且仅当其 bbox **完全被 zone 包含**（四个边界都在 zone 内部）。
+
+```
+word.page_idx == zone.page
+AND word.x0_pct >= zone.x0 AND word.x1_pct <= zone.x1
+AND word.y0_pct >= zone.y0 AND word.y1_pct <= zone.y1
+```
 
 **触发时机**：
-
 - 加载 zones 后
 - 每次 zone 增删改后
 - `_extract_words()` 末尾
 
-### 划词时 \_active\_words 的切换时机
+### 划词时 _active_words 的切换
 
-**切换发生在** **`_snap_start()`** **中**（line 1306-1322），即**鼠标按下时**：
+在 `_snap_start()`（鼠标按下时）确定：
+1. 阅读模式 + 有 zone → 判断鼠标落点是否在 zone 内
+2. 在 zone 内 → `_active_words = _words_inside`
+3. 在 zone 外 → `_active_words = _words_outside`
+4. 其他模式 → `_active_words = _words`（全部词）
 
-1. 判断鼠标落点是否在某个 zone 的矩形内
-2. 如果在 zone 内 → `_active_words = _words_inside`（只能选中 zone 内的词）
-3. 如果在 zone 外 → `_active_words = _words_outside`（不能选中任何 zone 内的词）
-4. 在非阅读模式或无 zone 时 → `_active_words = _words`（全部词）
+**锁定机制**：`_active_words` 在按下时确定，整个拖拽过程中不改变。一次划词不会跨越 zone 边界。
 
-**关键设计**：`_active_words` 在 `_snap_start` 中设置后就保持不变，整个拖拽过程中不会切换。这意味着**一次划词操作要么在 zone 内要么在 zone 外，不会跨越 zone 边界**。
+### 扩散至全文
 
-### 与划词引擎、缓存的耦合关系
+管理模式下右键隔离域 → "扩散至全文"：将当前 zone 的坐标复制到 PDF 所有页面（去重）。适用于页眉、页脚、页码等固定位置的内容。
 
-**结论：隔离域与缓存系统无交叉。**
+## 4.5 自动句补全
 
-- 隔离域通过 `_active_words` 影响划词引擎的候选池，不修改任何 word 对象本身
-- `_active_words` 中的词索引与 `_words` 保持一致（因为 inside/outside 只是 `_words` 的子集，索引不变）
-- 缓存中存储的坐标是 sub\_sentence 的起止坐标，来自 `_words` 中的实际 word 对象，不受隔离域影响
-- 因此隔离域逻辑与缓存读写完全正交
-
-## 3.4 自动句补全
-
-### expand\_to\_sentence 的触发条件
-
-**调用位置**：`reader_tab.py:_handle_sentence_auto_complete()` (line 677)
-
-自动句补全仅当以下条件同时满足时触发：
+### expand_to_sentence 的触发条件
 
 1. `auto_complete` 开关为 ON
 2. 选中词数 > 5（由 `classify()` 判定）
 
-### 句末检测算法 (is\_sentence\_end)
-
-**位置**：`sentence_analyzer.py:15-18`
+### 句末检测
 
 ```python
 SENTENCE_ENDS = {'.', '。', '!', '？', '?'}
-
-def is_sentence_end(text):
-    s = text.strip()
-    return bool(s) and s[-1] in SENTENCE_ENDS
 ```
 
-**判定标准**：去掉末尾空白后，最后一个字符是否为句末标点。
+去掉末尾空白后，最后一个字符是否为句末标点。
 
-**Chinese splitters**（用于译文拆分）还额外包括 `！`（全角感叹号）。
+### 扩展扫描逻辑
 
-### head\_fragment / tail\_fragment 的判定
+**左扫描（head_fragment）**：
+- 从 lo-1 向左扫描，限于当前页
+- 遇到句末标点 → `new_lo = i+1`, `head_fragment = False`
+- 遇到段落边界 → 停止扫描
+- 扫描到页首仍未找到句末 → `head_fragment = True`
 
-**位置**：`sentence_analyzer.py:expand_to_sentence()` (line 33-102)
+**右扫描（tail_fragment）**：
+- 如果 hi 已是句末 → `tail_fragment = False`
+- 否则从 hi+1 向右扫描，限于当前页
+- 遇到句末标点 → `new_hi = i`, `tail_fragment = False`
+- 遇到段落边界 → 停止扫描
+- 扫描到页尾仍未找到 → `tail_fragment = True`
 
+### 段落边界判定
+
+```python
+gap > median_line_gap * 1.1 → 段落边界
 ```
-Left scan (head_fragment):
-  从 lo-1 向左扫描，限于当前页
-  如果在某个词处遇到句末标点 → new_lo = i+1, head_fragment = False
-  如果遇到段落边界 → 停止扫描（head_fragment 取决于是否找到过句末）
-  如果扫描到页首仍未找到句末 → head_fragment = True（残句头）
 
-Right scan (tail_fragment):
-  如果 hi 已经是句末标点 → new_hi = hi, tail_fragment = False
-  否则从 hi+1 向右扫描，限于当前页
-  如果找到句末标点 → new_hi = i, tail_fragment = False
-  如果扫描到页尾仍未找到 → tail_fragment = True（残句尾）
-```
+其中 `median_line_gap` 从选中范围的相邻词 Y 间距计算中位数。若为单行选区，则从词 bbox 中位高度估算：`char_h * 1.2`。
 
-**段落边界判定**（`_is_para_boundary()`）：
+### 基线统计
 
-- 两个连续词之间的 Y 间距 > 中位行间距 \* 1.1 → 认为是段落边界
-- 仅在同页内判定
-
-**基线统计**（从选中范围采集）：
-
+从选中范围采集：
 - `median_size`：有字号信息的词的中位字号
 - `bold_ratio`：粗体词比例
 - `median_line_gap`：相邻词的 Y 间距中位数
-- `x0_median`：起始 X 坐标中位数（用于检测缩进）
+- `x0_median`：起始 X 坐标中位数
 
-### ON 模式和 OFF 模式的差异
+### ON 和 OFF 模式的差异
 
-| 特性   | ON（自动句补全）                        | OFF（手动模式）                       |
-| ---- | -------------------------------- | ------------------------------- |
-| 分类阈值 | 词数 > 5 → sentence                | 含句末标点 → sentence                |
-| 选区扩展 | 自动扩展 lo/hi 到句边界                  | 不扩展，保持用户划选范围                    |
-| 缓存查找 | `find_overlapping_entries`（坐标重叠） | `find_containing_entries`（坐标包含） |
-| 残句标记 | 来自 expand\_to\_sentence 的结果      | 直接判断 lo-1 和 hi 是否为句末            |
-| 触发方式 | 自动（划词松开后立即触发）                    | 手动（右键菜单或自动翻译开关）                 |
+| 特性 | ON（自动句补全） | OFF（手动模式） |
+| --- | --- | --- |
+| 分类阈值 | 词数 > 5 → sentence | 含句末标点 → sentence |
+| 选区扩展 | 自动扩展 lo/hi 到句边界 | 不扩展，保持用户划选范围 |
+| 缓存查找 | `find_overlapping_entries`（idx 重叠） | `find_containing_entries`（idx 包含） |
+| 残句标记 | 来自 expand_to_sentence | 直接判断 lo-1 和 hi 是否为句末 |
 
-**为什么 ON 用 overlapping 而 OFF 用 containing**：
+## 4.6 缓存系统
 
-- ON 模式选区被扩展到了完整句子边界，缓存条目也按完整句子存储，所以按坐标重叠查找即可匹配
-- OFF 模式选区可能只是句子的一部分，需要查找完全"包含"该选区的缓存条目（即该句子的完整缓存）
-
-## 3.5 公式元素回捞
-
-### 为什么需要回捞
-
-PDF 的字符流顺序（通过 `get_text("words")` 获得）是 PDF 内部编码顺序，可能与视觉阅读顺序不一致。典型的场景：
-
-- 数学公式中的上下标字符在字符流中出现在正常文本之后
-- 公式元素跨行分布
-
-**"回捞"**：通过空间邻近性（而非字符流邻近性），将视觉上属于选中范围的公式元素纳入选区。
-
-### 缓冲池的构建范围
-
-```python
-BUFFER = 20  # 在原始选中范围 lo/hi 两侧各扩展 20 个词
-```
-
-缓冲池从 `src`（即 `_active_words` 或 `_words`）中按索引范围截取：
-
-```python
-buf_lo = max(0, min(lo, hi) - BUFFER)
-buf_hi = min(len(src), max(lo, hi) + BUFFER + 1)
-candidate_words = src[buf_lo : buf_hi]
-```
-
-20 个词的缓冲区足够覆盖典型公式元素的偏移范围（通常不超过 1-2 行文字的宽度）。
-
-### 锚点墙的完整判断逻辑
-
-锚点墙（anchor walls）是 `_get_selected_words` 的核心过滤机制，消解了一个关键矛盾：缓冲池虽然扩大了候选范围，但不能让选区"无限制蔓延"。
+### 扁平结构
 
 ```
-first_anchor（选区的左上角锚点）
-last_anchor （选区的右下角锚点）
-
-First anchor wall → 阻挡"左上蔓延"：
-  - 逻辑 Y 在 first_anchor 下方太远的词 → 丢弃
-  - 与 first_anchor 同行但在其左侧的词 → 丢弃
-
-Last anchor wall → 阻挡"右下蔓延"：
-  - 逻辑 Y 在 last_anchor 上方太远的词 → 丢弃
-  - 与 last_anchor 同行但在其右侧的词 → 丢弃
-```
-
-锚点墙确保：公式元素如果在锚点之间（空间上属于选区范围内）则被纳入；如果在锚点范围之外（属于上文或下文的其他内容）则被过滤掉。
-
-### 几何重排的实现
-
-**位置**：`_get_selected_words` 第 1457-1462 行
-
-```python
-lines = self._group_words_into_lines(retrieved)
-result = []
-for line_words in lines:
-    line_words.sort(key=lambda w: w.x0_pct)  # 行内按 X 排序
-    result.extend(line_words)
-```
-
-- 先用 `_group_words_into_lines` 将所有通过的词按 Y 轴聚类为行
-- 每行内的词按 `x0_pct` 升序排列
-- 拼接所有行得到最终结果
-
-**为什么按 x0\_pct 而不是 x1\_pct 或 center\_x**：在从左到右的英文排版中，`x0_pct` 最接近视觉阅读顺序的左边界。
-
-## 3.6 缓存系统
-
-### 双层结构
-
-```
-cache
+cache (format_version=3)
   └─ [file_path]
-       ├─ single ─┬─ phrases: [{src, tgt}, ...]
-       │           └─ sentences: [{src, tgt, head_fragment, tail_fragment, sentences: [sub, ...]}, ...]
-       └─ dual   ─┬─ phrases: [...]
-                   └─ sentences: [...]
-
-format_version: 2
+       ├─ phrases: [{src, tgt}, ...]
+       └─ sentences: [{src, tgt, head_fragment, tail_fragment, sentences: [sub, ...]}, ...]
 ```
 
-- **phrases**：精确字符串匹配，用于短词组翻译
-- **sentences**：基于坐标范围匹配，用于句子级翻译，每个 entry 包含多个 sub\_sentence
-- **single / dual**：单栏和双栏模式完全独立分组，互不干扰
+不再有 `single`/`dual` 分组。所有 PDF 的缓存结构统一。
 
-### 坐标匹配的完整逻辑
+### idx 匹配（替代坐标匹配）
 
-#### find\_overlapping\_entries（重叠查找）
+#### find_overlapping_entries（重叠查找）
 
 **用于**：ON 模式（自动句补全）
 
 ```python
-def find_overlapping_entries(cache, file_path, sp, sy, ep, ey, is_dual):
-    """
-    在 sentence entries 中查找 sub 与查询范围 [sp,sy]→[ep,ey] 有重叠的条目。
-    重叠判定用 _ranges_overlap，仅比较 page 和 y_pct（忽略 x_pct）。
-    """
+def find_overlapping_entries(cache, file_path, start_idx, end_idx):
+    # 在 sentence entries 中查找 sub 的 idx 范围与 [start_idx, end_idx] 有重叠的条目
+    # 重叠判定：sub.start_idx <= end_idx AND sub.end_idx >= start_idx
 ```
 
-**重叠判定** (`_ranges_overlap`)：
-
-```python
-return not (e1 < s2 or e2 < s1)
-# 即：两个区间有交集，比较维度为 (page, y_pct)
-```
-
-#### find\_containing\_entries（包含查找）
+#### find_containing_entries（包含查找）
 
 **用于**：OFF 模式（手动句模式）
 
 ```python
-def find_containing_entries(cache, file_path, sp, sy, sx, ep, ey, ex, is_dual):
-    """
-    查找 first sub start ≤ query start 且 query end ≤ last sub end 的条目。
-    即缓存条目"包含"查询范围。
-    坐标优先级：page > y_pct > x_pct，使用 COORD_TOLERANCE(=0.001) 容差。
-    """
+def find_containing_entries(cache, file_path, start_idx, end_idx):
+    # 查找 first sub start_idx <= start_idx AND end_idx <= last sub end_idx 的条目
 ```
 
-#### coord\_le\_tolerant（容差坐标比较）
+**关键优势**：idx 是整数，匹配精确无歧义，不再需要 `COORD_TOLERANCE` 容差。
 
-```python
-COORD_TOLERANCE = 0.001  # 0.1% 页面尺寸
-
-def coord_le_tolerant(ap, ay, ax, bp, by, bx):
-    # 优先级：page > y_pct > x_pct
-    # 当 page 相同且 y_pct 在容差范围内时，用 x_pct 决定
-```
-
-### 双栏逻辑坐标变换在缓存中的应用
-
-**写入缓存前**（`reader_tab.py`）：
-
-```python
-if self._pdf_viewer.is_dual_column:
-    transform_dual_column_coords(sub_sentences)
-```
-
-对每个 sub\_sentence 的坐标应用 `transform_dual_column_coords()`：
-
-- 右栏：`x_pct -= 0.5`, `y_pct += 1.0`
-- 左栏：不变
-
-**缓存查找时**：查询坐标也需要经过同样的变换（由 `sentence_analyzer` 在拆分句子后立即执行），然后与缓存中已变换的坐标进行比较。
-
-### 残句自整理 (\_fragment\_self\_merge)
+### 残句自整理 (_fragment_self_merge)
 
 **触发时机**：每次写入 sentence cache 后自动调用。
 
-**位置**：`cache_store.py:find_mergeable_fragments()` (line 281-317)
-
 **合并算法**：
-
 ```
 循环直到没有可合并的 pair：
   遍历所有 sentence entries：
-    如果条目被标记为 head_fragment：
-      查找是否有另一个条目的最后一个 sub 的 end 坐标
-      与该条目的第一个 sub 的 end 坐标相同（精确匹配，通过 _coord_eq）
-      → 发现可合并对，方向为 "append"（另一个在前，该条目在后）
-
-    如果条目被标记为 tail_fragment：
-      查找是否有另一个条目的第一个 sub 的 start 坐标
-      与该条目的最后一个 sub 的 start 坐标相同
-      → 发现可合并对，方向为 "append"（该条目在前，另一个在后）
-
-  调用 merge_entries() 合并发现的 pair
+    如果条目是 head_fragment：
+      查找是否有另一个条目的 last sub end_idx + 1 == 该条目的 first sub start_idx
+      → 合并（另一个在前，该条目在后）
+    如果条目是 tail_fragment：
+      查找是否有另一个条目的 first sub start_idx == 该条目的 last sub end_idx + 1
+      → 合并（该条目在前，另一个在后）
+  调用 merge_entries() 合并
 ```
 
-**`_coord_eq`** **精确匹配**：使用 `COORD_TOLERANCE = 0.001` (0.1% 页面尺寸) 比较 page、x\_pct 和 y\_pct。
-
-```python
-def _coord_eq(ap, ax, ay, bp, bx, by):
-    return ap == bp and abs(ax - bx) < COORD_TOLERANCE and abs(ay - by) < COORD_TOLERANCE
-```
-
-**merge\_entries()**：
-
-- 收集所有 sub\_sentences，按坐标排序
-- 去重（相同 start 坐标的 sub 保留有非空 tgt 的版本）
-- 重新计算 head\_fragment / tail\_fragment
+**merge_entries()**：
+- 收集所有 sub_sentences，按 `start_idx` 排序
+- 去重（相同 `start_idx` 的 sub 保留有非空 tgt 的版本）
+- 重新计算 head_fragment / tail_fragment
 - 删除旧条目，插入合并后的新条目
 
-### 单栏/双栏独立分组
+### 旧版缓存兼容
 
-- **分组 key**：`"single"` vs `"dual"`
-- **独立存储**：切换单/双栏时缓存完全隔离，不会交叉污染
-- **切换确认**：`reader_tab._on_dual_column_toggle_requested()` 在切换时会弹窗提示"单栏与双栏 cache 相互独立"
-- **合理性**：双栏模式下坐标经过了变换，与单栏模式的坐标空间不同，共用缓存会导致坐标误匹配
+`format_version=2` 的缓存在加载时静默忽略（视为空缓存）。首次翻译会在新版格式下重新生成。
+
+## 4.7 `<br>` 标记与句数对齐
+
+### 问题
+
+英文句子拆分（以 `.` 为界）与中文翻译的句子切分（以 `。` 为界）不一定一一对应。LLM 可能输出与输入不同数量的句子，导致 `split_translation` 无法正确分配译文。
+
+### 解决方案
+
+**`join_subs_for_llm()`**：在非标点截断处（两个 sub_sentence 之间，前一个不以句末标点结尾）插入 `<br>` 标记：
+
+```
+sub_1_text <br> sub_2_text. sub_3_text!
+```
+
+**`split_translation()`**：先按 `<br>` 切分，再按中文标点（`。！？`）切分每段，最后按 `expected_count` 合并多余部分或填充空串。
+
+**前台显示**：`_show_result()` 在显示前过滤所有 `<br>` 标记。
 
 ***
 
-# 3.7 同行判断算法汇总
+# 5. UI 架构
 
-项目中存在多个"判断两个词是否同行"的位置，使用不同的算法和容差参数：
-
-| 位置                                                  | 算法          | 容差/参数                                      | 适用场景           | 原因                            |
-| --------------------------------------------------- | ----------- | ------------------------------------------ | -------------- | ----------------------------- |
-| `_group_words_into_lines()` (pdf\_viewer:1227)      | 单点容差        | `LINE_TOLERANCE = 0.005` (0.5% 页高)         | 双栏重排、行分组（提取阶段） | 提取阶段词都来自同一页、同一字号，单点容差足够       |
-| `_line_centers()` (pdf\_viewer:1192-1208)           | 单点容差聚类      | `LINE_TOLERANCE = 0.005`                   | 高亮渲染时的行识别      | 仅用于视觉渲染，与分组一致                 |
-| `_same_line()` (pdf\_viewer:1385-1394)              | Y 区间重叠度     | `overlap >= 0.5 * min(height_a, height_b)` | 划词时的同行判断（锚点墙）  | 处理跨页、跨栏场景，不同字号/位置偏差的词需要更稳健的算法 |
-| `_word_at_scene_pos` Step 5 (pdf\_viewer:1289-1296) | Y 区间重叠度     | `overlap >= 0.5 * min(height_a, height_b)` | 鼠标点击命中词的同行词收集  | 同上，不同字号词需要区间重叠判断              |
-| `_draw_highlights()` (pdf\_viewer:1490-1539)        | 单点容差 + 按页分组 | `LINE_TOLERANCE = 0.005`                   | 绘制高亮矩形         | 渲染阶段按页分组后再判同行，单点容差可靠          |
-| `_is_para_boundary()` (sentence\_analyzer:105-114)  | 间距比值        | `gap > median_line_gap * 1.1`              | 句补全时判断段落边界     | 动态计算中位行间距，自适应不同排版密度           |
-
-### 为什么有两种算法
-
-1. **单点容差**（LINE\_TOLERANCE）：适合**同页、同字号**的批量聚类场景。简单高效，对渲染和提取阶段足够。
-2. **Y 区间重叠度**（\_same\_line）：适合**跨页、混合字号**的精确判断场景。例如：
-   - 一个上标词（小字号，短区间）和一个正文词（大字号，长区间）可能有不同的 center\_y 但视觉上在同一行
-   - 仅靠 center\_y 差距可能误判为不同行
-   - 区间重叠度检查 Y 轴投影的重叠程度，更准确
-
-### 容差参数的具体值
-
-- `LINE_TOLERANCE = 0.005`：0.5% 页面高度。对于 A4 (297mm) 的 PDF，约为 1.5mm
-- `SPATIAL_TOLERANCE = 0.0005`：0.05% 页面高度，约 0.15mm。用于空间过滤的软边界
-- `COORD_TOLERANCE = 0.001`：0.1% 页面高度，约 0.3mm。用于缓存坐标精确匹配
-- `BUFFER = 20`：20 个词，用于空间检索的缓冲窗口
-
-***
-
-# 4. 模块间耦合关系
-
-## 数据流向图
+## 5.1 顶层布局
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                              main.py                                     │
-│                                │                                         │
-│                           MainApp                                        │
-│                     (ui/main_app.py)                                     │
-│                     ╱              ╲                                     │
-│           PDFViewer                  ReaderTab                           │
-│        (ui/pdf_viewer.py)         (ui/reader_tab.py)                     │
-│           │      │                  │       │                            │
-│           │      │    text_selected │       │                            │
-│           │      └──────────────────┼───────┘                            │
-│           │         auto_complete_  │                                    │
-│           │         changed         │                                    │
-│           │                        │                                    │
-│     ┌─────┴─────┐          ┌───────┴────────┐                          │
-│     │ 划词引擎   │          │  翻译调度       │                          │
-│     │ _get_     │          │  on_pdf_       │                          │
-│     │ selected_ │          │  selection()   │                          │
-│     │ words()   │          │                │                          │
-│     └─────┬─────┘          └───┬───┬────┬───┘                          │
-│           │                    │   │    │                               │
-│     ┌─────┴─────┐     ┌────────┴┐  │    │     ┌──────────────────┐     │
-│     │ 隔离域     │     │ 句补全   │  │    │     │   LLM Client     │     │
-│     │ _words_   │     │ expand_ │  │    │     │ (llm_client.py)  │     │
-│     │ inside/   │     │ to_     │  │    │     └──────────────────┘     │
-│     │ outside   │     │ sentence│  │    │                               │
-│     └───────────┘     └────┬────┘  │    │                               │
-│                            │       │    │                               │
-│                     ┌──────┴───┐   │    │                               │
-│                     │ 句子拆分  │   │    │                               │
-│                     │ split_   │   │    │                               │
-│                     │ sentences│   │    │                               │
-│                     └──────┬───┘   │    │                               │
-│                            │       │    │                               │
-│                     ┌──────┴───────┴────┴──────┐                        │
-│                     │       Cache Store        │                        │
-│                     │   (cache_store.py)       │                        │
-│                     │                          │                        │
-│                     │  find_overlapping_entries│                        │
-│                     │  find_containing_entries │                        │
-│                     │  merge_entries           │                        │
-│                     │  find_mergeable_fragments│                        │
-│                     └──────────────────────────┘                        │
-└──────────────────────────────────────────────────────────────────────────┘
+MainApp (QVBoxLayout)
+├─ Top Bar: 窗口尺寸选择 + 打开 PDF 按钮 + 文件名标签
+└─ QSplitter
+   ├─ Left Area (QHBoxLayout)
+   │   ├─ TOCPanel (可折叠目录侧栏，200px/15px)
+   │   └─ PDFViewer (PDF 渲染 + 交互)
+   └─ ReaderTab (右侧控制面板，固定 ≥500px)
+        ├─ 模型配置（URL/Key/Model/Prompt 全局共享）
+        └─ QTabWidget
+            ├─ Tab "划词速翻"（Fast）
+            └─ Tab "翻译持久化"（Persist）
 ```
 
-### 关键信号流
+## 5.2 信号流
 
 ```
 pdf_viewer.text_selected(lo, hi, text)
@@ -784,295 +577,307 @@ pdf_viewer.selection_started()
   → reader_tab._on_selection_started()  # 追加历史结果分隔线
 
 pdf_viewer.auto_complete_changed(enabled)
-  → main_app 持久化到 config.json
+  → main_app._on_auto_complete_changed()  # 持久化到 config.json
 
 pdf_viewer.note_path_needed()
   → main_app._ensure_note_path()  # 自动生成 note 文件路径
 
+pdf_viewer.layout_path_needed()
+  → main_app._ensure_layout_path()  # 自动生成 layout 缓存路径
+
+pdf_viewer.toc_collapsed_changed(collapsed)
+  → main_app._on_toc_collapsed_changed()  # 持久化
+
+pdf_viewer.isolate_path_needed()
+  → reader_tab._ensure_per_pdf_paths()  # 自动生成 isolate 文件路径
+
 reader_tab.inject_pdf_viewer(viewer)
-  # 建立双向连接：reader_tab 持有 pdf_viewer 引用，
-  # 同时连接 pdf_viewer 的 dual_column_toggle 和 isolate_path_needed 信号
+  # 建立双向连接，关联 isolate_path_needed 信号
 ```
 
-### 隔离域 ↔ 划词引擎
+## 5.3 PDF 渲染
+
+### 懒加载策略
+
+1. **首次加载**：计算所有页面的场景位置（placeholder 灰色矩形），同步渲染当前页 ±2 页
+2. **后台预渲染**：剩余页面按距当前页的距离排序，在 `_PrerenderWorker` 中后台渲染，每 2 页一批，批次间间隔 500ms
+3. **滚动画布**：`_on_scrolled()` 检测当前可见范围，按需同步渲染 ±3 页内未渲染的页面
+4. **窗口 resize**：不重新提取 word 数据（百分比坐标不受影响），仅重新渲染页面 pixmap（100ms 防抖）
+
+### 坐标映射
+
+| 坐标系 | 用途 |
+| --- | --- |
+| PDF 物理坐标（points） | `_page_width_pts`, `_page_height_pts`，页面原始尺寸 |
+| 百分比坐标（0–1） | `_Word` 的 `x0_pct/y0_pct/x1_pct/y1_pct`，zone 坐标 |
+| Scene 坐标（像素） | QGraphicsScene 中的实际渲染位置 |
+
+转换公式：
+```python
+# 百分比 → scene
+scene_x = x_pct * available_width
+scene_y = page_offsets[page_idx] + y_pct * page_height_pts[page_idx] * scale_factor
+
+# scene → 百分比
+x_pct = scene_x / available_width
+y_pct = (scene_y - page_offsets[page_idx]) / (page_height_pts[page_idx] * scale_factor)
+```
+
+## 5.4 高亮渲染
+
+`_draw_highlights()` 在同行内按 `block_id` 分组绘制独立矩形：
+
+```
+for each line in selected words:
+  group words by block_id
+  for each block_group:
+    draw single rect spanning the block's words only
+```
+
+这确保跨栏选区不会产生从左栏延伸到右栏的大矩形，每个栏/块有独立的高亮矩形。
+
+## 5.5 笔记系统
+
+- **放置**：笔记模式（按钮或 Alt+N）下点击 → 在 scene 位置放置笔记图标
+- **编辑**：点击图标 → 展开 `_NoteEditor`（QTextEdit）通过 `_NoteProxy`（支持右下角边缘拖拽 resize）
+- **拖拽**：笔记模式下拖拽图标改变位置
+- **保存**：500ms 防抖自动保存 + 关闭时强制保存
+- **删除**：右键图标 → 删除笔记（不可撤销）
+
+## 5.6 Per-PDF 配置
+
+每个 PDF 有独立的四个配置文件路径：
+- **缓存文件** (`_cache`)：翻译缓存
+- **隔离文件** (`_isolate`)：隔离域配置
+- **版面文件** (`_layout`)：布局缓存（词列表）
+- **笔记文件** (`_note`)：笔记数据
+
+默认自动生成在 `data/` 目录，可在 PDF 历史界面的 `...` 配置按钮中手动绑定。
+
+## 5.7 翻译模式
+
+### 划词速翻（Fast）
+
+划选 PDF 文本 → 自动（或右键触发）翻译，结果显示在右侧文本框。支持：
+- 自动句补全 ON/OFF
+- 缓存 OFF 选项
+- 短语缓存（精确匹配）/ 句子缓存（idx 重叠匹配）
+- 两阶段流程（扩展 → 缓存检查 → LLM 翻译）
+
+### 翻译持久化（Persist）
+
+手动输入或粘贴文本 → 翻译 → 写入 Markdown 文件：
+- **New**：创建新 .md 文件，指定目录和文件名
+- **Append**：追加到已有 .md 文件
+- 支持粘贴时自动去换行 / 手动清洗换行
+
+### 工作线程
+
+所有 LLM 调用在 `QThread` 子类中执行：
+- `_FastTranslateWorker`：划词速翻
+- `_PersistTranslateWorker`：翻译持久化（含文件写入）
+
+通过信号 `finished` 回传结果，不阻塞 UI。
+
+***
+
+# 6. 模块间耦合关系
+
+## 数据流向图
+
+```
+main.py → MainApp
+              ├─ PDFViewer
+              │    ├─ page_analysis/pdf_parser.py  → 提取 + 归一化
+              │    ├─ page_analysis/xy_cut_sorter.py → XY-Cut++ 排序
+              │    ├─ page_analysis/post_merge_indexer.py → 后处理
+              │    ├─ 划词引擎 (_get_selected_words)
+              │    ├─ 隔离域系统 (_zones, _words_inside/outside)
+              │    ├─ 笔记系统 (_notes, _NoteProxy)
+              │    ├─ TOC 面板
+              │    └─ 懒加载渲染 (_PrerenderWorker)
+              │
+              └─ ReaderTab
+                   ├─ services/cache_store.py → 缓存读写
+                   ├─ services/sentence_analyzer.py → 句补全 + 拆分
+                   ├─ services/llm_client.py → LLM API 调用
+                   ├─ services/model_fetcher.py → 模型列表获取
+                   ├─ services/prompt_loader.py → Prompt 加载
+                   ├─ services/file_writer.py → 翻译结果持久化
+                   ├─ services/config_store.py → 全局配置
+                   └─ services/note_store.py → 笔记持久化
+```
+
+## 隔离域 ↔ 划词引擎
 
 ```
 隔离域变化 (_rebuild_word_lists)
   → 更新 _words_inside / _words_outside
     → 划词时 _snap_start 根据鼠标落点选择 _active_words
       → _word_at_scene_pos 使用 _active_words 作为候选池
-        → _get_selected_words 使用 _active_words 作为源数据
+        → _get_selected_words 直接从 _active_words 切片
 ```
 
-隔离域不修改任何 word 对象，不影响缓存存储的坐标。
-
-### 句补全 → 缓存写入
+## 句补全 → 缓存写入
 
 ```
 expand_to_sentence → 确定 head/tail fragment → split_sentences
-  → transform_dual_column_coords（如果是双栏）
-    → find_overlapping_entries / find_containing_entries
-      → 如果有缓存命中 → 直接提取译文
-      → 否则 → LLM 翻译 → 写入 sentence entry
-        → _fragment_self_merge（自动整理残句）
+  → join_subs_for_llm（插入 <br> 标记）
+    → find_overlapping_entries / find_containing_entries（按 idx）
+      → 缓存命中 → 直接提取译文
+      → 缓存未命中 → LLM 翻译 → split_translation（按 <br> + 标点切分）
+        → 写入 sentence entry
+          → _fragment_self_merge（自动整理残句）
 ```
 
-### 公式回捞 → 几何重排 → emit 信号
+## 划词 → 翻译
 
 ```
 用户鼠标拖拽 → _snap_start → _snap_end
-  → _get_selected_words
-    → 缓冲池扩展 (BUFFER=20)
-    → 锚点墙过滤 (first_anchor / last_anchor)
-    → 空间过滤 (SPATIAL_TOLERANCE)
-    → 几何重排 (_group_words_into_lines → sort by x0_pct)
-  → 拼接文本 → 清洗换行符
-  → text_selected signal → reader_tab
+  → _get_selected_words (idx 切片)
+  → 拼接文本 → clean_newlines
+  → text_selected signal → reader_tab.on_pdf_selection()
+    → classify() 判断 phrase/sentence
+    → 缓存查找 / LLM 翻译
 ```
 
 ***
 
-# 5. 扩展接口分析
+# 7. 设计决策
 
-## 5.1 OCR 集成点
+## 7.1 XY-Cut 排版引擎 vs 启发式双栏检测
 
-**数据提供源的位置**：`pdf_viewer.py:_extract_words()` (line 805-862)
+**选择**：XY-Cut++ 递归投影分割自动处理所有排版。
 
-当前数据流：
+**原因**：自动识别多栏、表格、参考文献等复杂排版，词序由算法保证，无需用户手动切换单/双栏。扫描线算法性能为 O(n log n)。
 
-```
-PyMuPDF (fitz) page.get_text("words") → _Word 对象列表
-```
+**代价**：首次解析 PDF 需要 2–10 秒（通过布局缓存缓解）。排版极端复杂的 PDF 可能不完美。
 
-### 替换方式
+## 7.2 idx 匹配 vs 坐标匹配
 
-在 `_extract_words()` 中，将 PyMuPDF 的 word 提取替换为 OCR 引擎的输出。核心替换点在：
-
-```python
-# pdf_viewer.py line 823
-words_data = page.get_text("words")  # ← 替换这里
-
-# 以及 line 813-821 的 span_info 提取
-dict_data = page.get_text("dict")    # ← 替换这里（提供字号/粗体信息）
-```
-
-### 是否可以做到切换后不影响其他模块
-
-**可以**，前提是 OCR 输出格式满足以下约定：
-
-OCR 需要将输出转换为 `_Word` 对象列表，每个 `_Word` 包含：
-
-- `page_idx`: 页码
-- `x0_pct, y0_pct, x1_pct, y1_pct`: 百分比坐标（以页面尺寸归一化）
-- `text`: 单词文本
-- `size`: 字号（可选，默认 0.0）
-- `flags`: 字体标记（可选，默认 0）
-- `idx`: 全局索引（由 `_extract_words` 统一分配）
-
-**不需要修改的模块**：
-
-- 划词引擎（`_get_selected_words`）：只依赖 `_Word` 的坐标和文本字段
-- 隔离域（`_rebuild_word_lists`）：只依赖 `_Word` 的 bbox 和 page\_idx
-- 缓存系统：只依赖 sub\_sentence 的坐标和原文（由上层传入，不直接读取 `_Word`）
-- 句补全（`expand_to_sentence`）：依赖 `_Word` 的 text、page\_idx、size、flags、y0\_pct
-
-**需要提供的 OCR 数据格式**：
-
-```
-对于每个页面，OCR 需要输出：
-[
-  (x0, y0, x1, y1, text),  # bbox 以 PDF 点为单位的物理坐标
-  ...
-]
-以及可选的每词字号和字体信息：
-{
-  (x0, y0): (size, flags),
-  ...
-}
-```
-
-**注意**：OCR 引擎需要能够将识别到的文本分割为"单词"粒度（以空格和标点分隔），因为整个项目的语义单元是 word 而非 character。
-
-## 5.2 排版算法替换点
-
-### 行分组算法 (`_group_words_into_lines`)
-
-**位置**：`pdf_viewer.py:1210-1225`
-
-**接口**：
-
-```python
-@staticmethod
-def _group_words_into_lines(words: list[_Word]) -> list[list[_Word]]:
-```
-
-**输入**：`list[_Word]`（任意顺序）
-**输出**：`list[list[_Word]]`（每行一个子列表，行内保持原始顺序）
-
-**约定**：
-
-- 每行内单词不需要排序（调用方自己排序）
-- 行的顺序应从上到下
-- 同一个 word 不应出现在多个行中
-
-### 双栏识别算法 (`_reorder_dual_column`)
-
-**位置**：`pdf_viewer.py:864-896`
-
-**接口**：
-
-```python
-def _reorder_dual_column(page_words: list[_Word], page_width: float) -> list[_Word]:
-```
-
-**输入**：
-
-- `page_words`: 单页的 word 列表（按 PDF 字符流原始顺序）
-- `page_width`: 页面宽度（PDF points）
-
-**输出**：重排后的 word 列表（阅读顺序）
-
-**当前算法**：
-
-- 调用 `_group_words_into_lines()` 分行
-- 每行独立判断：是否有跨中线词（`x0_pct < 0.49 and x1_pct > 0.51`）
-- 有跨中线词 → 整行保持原序（单栏行，如标题）
-- 无跨中线词 → 左栏词在前，右栏词在后
-- 左栏词 `center_x < 0.5`，右栏词 `center_x >= 0.5`
-
-**替换约定**：新算法满足相同的输入输出接口即可，内部实现完全自由。更高级的算法可以利用：
-
-- `_Word.size`（字号信息，标题通常字号更大）
-- `_Word.flags`（粗体标记）
-- 词间距的中位数
-- 机器学习分类器
-
-### 物理列分割 (`_split_line_by_physical_column`)
-
-**位置**：`pdf_viewer.py:1231-1248`
-**用途**：高亮渲染时，将一行的词按物理列拆分为左右两组，确保高亮矩形的绘制不会跨栏
-
-## 5.3 其他可能的扩展点
-
-### 支持更多语言
-
-**当前的英文假设**：
-
-- `_Word` 粒度是"单词"（以空格分隔），非字母
-- `SENTENCE_ENDS = {'.', '。', '!', '？', '?'}` 的句末检测
-- 空格拼接单词（`" ".join(w.text for w in words)`）
-
-**扩展需要**：
-
-1. **中文 PDF**：中文词间通常无空格，PyMuPDF 的 `get_text("words")` 可能返回词组或单字。需要调整拼接逻辑（中文不需要空格）
-2. **日文**：类似中文，需要去除空格拼接
-3. **RTL 语言（阿拉伯语、希伯来语）**：
-   - 预览渲染：Qt 的 `QGraphicsScene` 不原生支持 RTL 文字方向
-   - 句末检测需要添加 RTL 标点（`؟` 等）
-   - `split_translation` 中的译文拆分逻辑使用 `。！？` 作为分隔符，对非中文输出需要调整
-
-### 支持 RTL 文字
-
-**主要修改点**：
-
-1. **`_get_selected_words`** **几何重排** (line 1460)：RTL 阅读顺序从右到左，需要 `sort(key=lambda w: w.x0_pct, reverse=True)`
-2. **`_word_at_scene_pos`**：不需要修改（空间命中算法是方向无关的）
-3. **文本拼接**：RTL 语言不应用空格拼接，字符应直接连接
-4. **高亮渲染**：不需要修改（基于 bbox 的几何渲染是方向无关的）
-
-### 潜在的新隔离域模式
-
-当前隔离域只有矩形区域。可以扩展为：
-
-- 多边形域（支持更精确的图表区域圈选，但坐标包含判定会变得复杂）
-
-由于隔离域完全封装在 `_rebuild_word_lists()` 中，所有新模式只需要修改该函数的过滤条件。
-
-***
-
-# 6. 已知设计取舍
-
-## 6.1 百分比坐标系 vs 绝对坐标
-
-**选择**：所有核心数据（`_Word`、zone、cache sub）使用百分比坐标。
-
-**原因**：百分比坐标与渲染分辨率解耦。窗口 resize 时不需要重新提取 word 数据，只需要重新渲染页面 pixmap。高分辨率和低分辨率屏幕上，划词引擎的行为完全一致。
-
-**代价**：每次坐标使用都需要转换（百分比 → scene 像素），有少量计算开销。但从架构简洁性看是值得的。
-
-## 6.2 单词粒度 vs 字符粒度
-
-**选择**：最小语义单元是 word（单词），不支持选中单词中的单个字母。
+**选择**：缓存以全局词索引（`start_idx` / `end_idx`）匹配，而非百分比坐标。
 
 **原因**：
+- idx 是整数，匹配精确无歧义
+- 不受坐标系变换影响
+- 不受坐标容差问题影响（旧版 `COORD_TOLERANCE=0.001` 在某些场景下不够精确）
+- 缓存条目在不同单/双栏模式间自然统一
 
-- PyMuPDF 的 `get_text("words")` 天然提供 word 粒度
-- 翻译场景中 word 是自然的最小意义单元
-- 字符粒度会让索引系统和缓存坐标系统复杂度暴涨
+**代价**：移除双栏逻辑后，旧版缓存（format_version=2）全部失效。
 
-**限制**：不支持字母级别的精确选中（readme 中已注明）。
+## 7.3 百分比坐标系 vs 绝对坐标
 
-## 6.3 逻辑坐标变换的"使用时变换"策略
+**选择**：所有核心数据使用百分比坐标（0–1 范围，以页面尺寸归一化）。
 
-**选择**：双栏逻辑变换不在数据存储时执行，而在每次使用时通过 helper 函数计算。
+**原因**：与渲染分辨率解耦。窗口 resize 时不需要重新提取 word 数据。
 
-**原因**：
+**代价**：每次坐标使用都需要转换（百分比 → scene 像素），有微量计算开销。
 
-- `_Word` 的物理坐标被多处使用（渲染、隔离域、鼠标命中），这些场景都需要物理坐标
-- 只有划词选择和缓存匹配需要逻辑坐标
-- 如果修改存储，需要额外标记"已变换"还是"未变换"，增加出错风险
+## 7.4 单词粒度 vs 字符粒度
 
-**代价**：每次使用都需要判断 `is_dual_column` 并计算偏移，有微量性能开销。
+**选择**：最小语义单元是 word（单词）。
 
-## 6.4 缓存键 = PDF 绝对路径
+**原因**：PyMuPDF 天然提供 word 粒度；翻译场景中 word 是自然的最小意义单元。
+
+**限制**：不支持字母级别的精确选中。
+
+## 7.5 缓存键 = PDF 绝对路径
 
 **选择**：缓存以 PDF 文件的绝对路径作为 key。
 
-**原因**：简单可靠，不需要额外的文件指纹或哈希。
+**代价**：移动或重命名 PDF 后缓存失效，需要手动重新绑定。
 
-**代价**：移动或重命名 PDF 后缓存失效，用户需要手动重新绑定（readme 中已注明）。
-
-## 6.5 单栏/双栏缓存完全隔离
-
-**选择**：`single` 和 `dual` 两组缓存，切换后独立使用。
-
-**原因**：双栏模式下坐标经过了逻辑变换，与单栏模式的坐标空间不同。共用会导致坐标匹配错误。
-
-**代价**：同一篇 PDF 在两种模式下需要分别翻译，切换后可能遇到"空缓存"。
-
-## 6.6 残句自整理采用迭代合并
-
-**选择**：`_fragment_self_merge()` 使用 while 循环反复查找可合并对，直到没有更多可合并项。
-
-**原因**：合并操作可能产生新的可合并 fragment（例如合并 A+B 后的新条目可能又与 C 共享边界），一次性遍历无法处理这种级联合并。
-
-**代价**：最坏情况下 O(n²) 的合并次数，但实践中缓存条目数通常不大（几百到几千）。
-
-## 6.7 划词时 \_active\_words 在 press 时锁定
+## 7.6 划词时 _active_words 在 press 时锁定
 
 **选择**：`_active_words` 在鼠标按下时确定，整个拖拽过程中不改变。
 
-**原因**：避免用户在 zone 边界附近拖拽时，`_active_words` 在 inside 和 outside 之间来回切换，导致选区内容不稳定。
+**原因**：避免用户在 zone 边界附近拖拽时，候选池在 inside/outside 之间来回切换。
 
-**代价**：用户无法通过一次拖拽同时选中 zone 内和 zone 外的内容（这正是设计意图）。
+## 7.7 布局缓存
 
-## 6.8 缓存 OFF 时跳过所有缓存操作
+**选择**：首次解析后序列化词列表，再次打开时直接加载（前提：PDF 修改时间未变）。
 
-**选择**：勾选"缓存 OFF"后，翻译不读取缓存也不写入缓存，但不影响自动句补全的行为。
+**原因**：XY-Cut 解析大型 PDF（200+ 页）可能需要数秒，布局缓存消除重复等待。
 
-**原因**：缓存错位是已知问题（readme 已有说明），"缓存 OFF"是用户的逃生舱。但句补全是独立的文本分析功能，不受缓存质量影响，因此不禁用。
+**代价**：PDF 内容变化（如 OCR 层更新）而修改时间未变时，布局缓存可能过期。此时需手动删除布局文件。
 
-## 6.9 仅测试过英文文献
+## 7.8 点到 bbox 距离的划词命中
 
-**选择**：项目开发和测试的目标语言为英文原文 → 中文译文。
+**选择**：`_word_at_scene_pos` 使用点到矩形 bbox 的最短欧氏距离。
 
-**原因**：作者的硕士论文为英文，翻译目标为中文。句末检测的标点集（`.`, `。`, `!`, `？`, `?`）和译文拆分逻辑都基于中文输出。
+**原因**：解决了长词边缘被上方短词"劫走"的问题。点在 bbox 内时距离为 0（绝对优先），在 bbox 外时只计算超出 x/y 范围的偏移分量。
 
-**限制**：其他语言对的翻译效果未经测试，句末检测可能不准确。
+## 7.9 Y 区间重叠的行分组
 
-## 6.10 不支持的场景
+**选择**：`_group_words_into_lines` 使用 Y 区间重叠度（≥50% 即同行）。
 
-- 扫描版 PDF（仅有图片，无可选中的文字层）
-- 公式密集区域的回捞效果取决于 PDF 文字编码质量
-- Windows 打包版（exe）未签名，可能触发 SmartScreen 警告
+**原因**：正确处理混合字号场景（上下标、公式元素）。仅靠 center_y 单点容差在字号差异大时会误判不同行。
 
+## 7.10 仅测试过英文文献
+
+**选择**：目标语言为英文原文 → 中文译文。
+
+**限制**：句末检测标点集基于英文/中文。其他语言对未经测试。
+
+***
+
+# 8. 扩展接口
+
+## 8.1 OCR 引擎替换
+
+**位置**：`page_analysis/pdf_parser.py:_ocr_extract_words()`
+
+替换此函数的实现即可切换 OCR 后端（当前基于 PyMuPDF 内置 Tesseract）。函数签名：
+
+```python
+def _ocr_extract_words(page: fitz.Page, language: str, dpi: int) -> Optional[List[dict]]
+```
+
+返回的每个 dict 需包含 `x0, y0, x1, y1, text`（PyMuPDF top-left 坐标）。坐标归一化由 `_normalize_page()` 统一处理。
+
+## 8.2 PDF 解析器替换
+
+**位置**：`page_analysis/schema.py` 定义合约
+
+替换整个 `parse_pdf()` 函数即可。签名：
+
+```python
+def parse_pdf(filepath: str, **kwargs) -> List[dict]
+```
+
+返回的 page dict 需符合 `REQUIRED_PAGE_KEYS`，每页的 word dict 需符合 `REQUIRED_WORD_KEYS`。坐标需为归一化坐标（0–1，底部原点）。
+
+## 8.3 排版算法替换
+
+`CleanedXYCutSorter.sort()` 接受 `list[dict]`（标准 word dict），返回排序后的 `list[dict]`。替换此函数即可接入不同的排版算法，下游（`_extract_words`）不感知算法细节。
+
+## 8.4 支持更多语言
+
+主要修改点：
+- **中文/日文 PDF**：word 粒度可能需要调整（中文无空格分隔），拼接逻辑需修改
+- **RTL 语言**：`_Word.text` 拼接需去除空格；Qt 不原生支持 RTL，渲染方向可能需要额外处理
+- **句末检测**：需添加目标语言的句末标点
+
+***
+
+# 9. 已知限制
+
+- 扫描版（图片型）PDF 暂不支持（需 PDF 内有可选中文字层，OCR 回退可部分缓解但效果有限）
+- 最小语义单元是 word（单词），无法选中单词内的单个字母
+- 仅测试过英文文献 → 中文翻译场景
+- Windows exe 未签名，可能触发 SmartScreen 警告
+- 句子匹配依赖标点符号切分，在标点使用不规范的 PDF 中可能产生错误的句子划分
+- XY-Cut 在极端复杂排版（如多栏嵌套表格）中可能产生非最优排序
+
+***
+
+# 10. 依赖
+
+```
+PySide6 >= 6.4.0    # Qt for Python UI 框架
+PyMuPDF >= 1.22.0    # PDF 渲染 + 文字提取 + OCR
+requests >= 2.28.0   # HTTP 客户端（LLM API 调用）
+```
+
+可选依赖：
+- Tesseract OCR（系统级安装，PyMuPDF 通过 `get_textpage_ocr()` 调用）

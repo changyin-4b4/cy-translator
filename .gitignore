@@ -4,9 +4,12 @@
 
 # 本地数据目录
 /data/
+/backup/
+
 
 # 本地工具目录
 /.claude/
+/.antigravitycli/
 
 # Python 缓存
 __pycache__/

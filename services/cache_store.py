@@ -12,15 +12,19 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 # ── Load / save ─────────────────────────────────────────────────────
 
 def load_cache(path: str | None = None) -> dict:
-    """Load cache from path, or global CACHE_PATH if path is None."""
+    """Load cache from path, or global CACHE_PATH if path is None.
+    Old format_version 2 caches are treated as empty (format changed)."""
     p = Path(path) if path else CACHE_PATH
     if not p.exists():
         return _empty_cache()
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return _empty_cache()
+    if data.get("format_version") != 3:
+        return _empty_cache()
+    return data
 
 
 def save_cache(cache: dict, path: str | None = None) -> None:
@@ -31,207 +35,121 @@ def save_cache(cache: dict, path: str | None = None) -> None:
 
 
 def _empty_cache() -> dict:
-    return {"format_version": 2}
+    return {"format_version": 3}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _ensure_file(cache: dict, file_path: str) -> dict:
+    """Return cache[file_path], creating flat phrases/sentences structure if missing."""
     if file_path not in cache:
-        cache[file_path] = {
-            "single": {"phrases": [], "sentences": []},
-            "dual": {"phrases": [], "sentences": []},
-        }
+        cache[file_path] = {"phrases": [], "sentences": []}
     entry = cache[file_path]
-    if isinstance(entry, list):
-        cache[file_path] = {
-            "single": {"phrases": [], "sentences": []},
-            "dual": {"phrases": [], "sentences": []},
-        }
+    # Migrate old format: if entry has "single"/"dual" keys, convert to flat
+    if "single" in entry or "dual" in entry:
+        phrases = []
+        sentences = []
+        for gk in ("single", "dual"):
+            g = entry.get(gk, {})
+            if isinstance(g, dict):
+                phrases.extend(g.get("phrases", []))
+                sentences.extend(g.get("sentences", []))
+        cache[file_path] = {"phrases": phrases, "sentences": sentences}
         return cache[file_path]
-    for group_key in ("single", "dual"):
-        group = entry.setdefault(group_key, {"phrases": [], "sentences": []})
-        if not isinstance(group, dict):
-            entry[group_key] = {"phrases": [], "sentences": []}
-            group = entry[group_key]
-        group.setdefault("phrases", [])
-        group.setdefault("sentences", [])
+    entry.setdefault("phrases", [])
+    entry.setdefault("sentences", [])
     return entry
-
-
-def _get_group(cache: dict, file_path: str, is_dual: bool) -> dict:
-    """Return the cache group dict ('single' or 'dual') for the given file."""
-    fe = _ensure_file(cache, file_path)
-    key = "dual" if is_dual else "single"
-    return fe[key]
-
-
-def _sub_first(sub: dict) -> tuple:
-    return (sub["start_page"], sub["start_y_pct"])
-
-
-def _sub_last(sub: dict) -> tuple:
-    return (sub["end_page"], sub["end_y_pct"])
-
-
-def _coord_lt(ap, ay, bp, by) -> bool:
-    return (ap, ay) < (bp, by)
-
-
-def _coord_le(ap, ay, bp, by) -> bool:
-    return (ap, ay) <= (bp, by)
-
-
-COORD_TOLERANCE = 0.001
-
-
-def _coord_eq(ap, ax, ay, bp, bx, by) -> bool:
-    return ap == bp and abs(ax - bx) < COORD_TOLERANCE and abs(ay - by) < COORD_TOLERANCE
-
-
-def coord_le_tolerant(ap, ay, ax, bp, by, bx) -> bool:
-    """Return True if (ap, ay, ax) <= (bp, by, bx) with tolerance.
-    Priority: page > y_pct > x_pct. Values within COORD_TOLERANCE are equal."""
-    if ap < bp:
-        return True
-    if ap > bp:
-        return False
-    if ay < by - COORD_TOLERANCE:
-        return True
-    if ay > by + COORD_TOLERANCE:
-        return False
-    return ax <= bx + COORD_TOLERANCE
-
-
-def _ranges_overlap(s1p, s1y, e1p, e1y, s2p, s2y, e2p, e2y) -> bool:
-    return not (
-        _coord_lt(e1p, e1y, s2p, s2y) or
-        _coord_lt(e2p, e2y, s1p, s1y)
-    )
 
 
 # ── Phrase cache ────────────────────────────────────────────────────
 
-def lookup_phrase(cache: dict, file_path: str, src: str,
-                  is_dual: bool = False) -> str | None:
+def lookup_phrase(cache: dict, file_path: str, src: str) -> str | None:
     """Exact match on src. Returns tgt or None."""
-    group = _get_group(cache, file_path, is_dual)
-    for p in group["phrases"]:
+    fe = _ensure_file(cache, file_path)
+    for p in fe["phrases"]:
         if p["src"] == src:
             return p["tgt"]
     return None
 
 
-def add_phrase_entry(cache: dict, file_path: str, src: str, tgt: str,
-                     is_dual: bool = False) -> None:
+def add_phrase_entry(cache: dict, file_path: str, src: str, tgt: str) -> None:
     """Add or replace a phrase cache entry (keyed by src)."""
-    group = _get_group(cache, file_path, is_dual)
-    for p in group["phrases"]:
+    fe = _ensure_file(cache, file_path)
+    for p in fe["phrases"]:
         if p["src"] == src:
             p["tgt"] = tgt
             return
-    group["phrases"].append({"src": src, "tgt": tgt})
+    fe["phrases"].append({"src": src, "tgt": tgt})
 
 
 # ── Sentence cache ──────────────────────────────────────────────────
 
-def add_sentence_entry(cache: dict, file_path: str, entry: dict,
-                       is_dual: bool = False) -> None:
-    """Add or replace a sentence cache entry (keyed by coordinate range).
+def add_sentence_entry(cache: dict, file_path: str, entry: dict) -> None:
+    """Add or replace a sentence cache entry (keyed by idx range).
     If entry has no sub-sentences, falls back to src string comparison."""
-    group = _get_group(cache, file_path, is_dual)
+    fe = _ensure_file(cache, file_path)
     subs = entry.get("sentences", [])
     if subs:
         fs = subs[0]
         ls = subs[-1]
-        for i, existing in enumerate(group["sentences"]):
+        for i, existing in enumerate(fe["sentences"]):
             existing_subs = existing.get("sentences", [])
             if existing_subs:
                 efs = existing_subs[0]
                 els = existing_subs[-1]
-                if (
-                    coord_le_tolerant(
-                        fs["start_page"], fs["start_y_pct"], fs["start_x_pct"],
-                        efs["start_page"], efs["start_y_pct"], efs["start_x_pct"],
-                    ) and coord_le_tolerant(
-                        efs["start_page"], efs["start_y_pct"], efs["start_x_pct"],
-                        fs["start_page"], fs["start_y_pct"], fs["start_x_pct"],
-                    ) and coord_le_tolerant(
-                        ls["end_page"], ls["end_y_pct"], ls["end_x_pct"],
-                        els["end_page"], els["end_y_pct"], els["end_x_pct"],
-                    ) and coord_le_tolerant(
-                        els["end_page"], els["end_y_pct"], els["end_x_pct"],
-                        ls["end_page"], ls["end_y_pct"], ls["end_x_pct"],
-                    )
-                ):
-                    group["sentences"][i] = entry
+                if (fs["start_idx"] == efs["start_idx"] and
+                        ls["end_idx"] == els["end_idx"]):
+                    fe["sentences"][i] = entry
                     return
     else:
-        for i, existing in enumerate(group["sentences"]):
+        for i, existing in enumerate(fe["sentences"]):
             if existing["src"] == entry["src"]:
-                group["sentences"][i] = entry
+                fe["sentences"][i] = entry
                 return
-    group["sentences"].append(entry)
+    fe["sentences"].append(entry)
+
+
+def _sub_first(sub: dict) -> int:
+    return sub["start_idx"]
 
 
 def find_overlapping_entries(cache: dict, file_path: str,
-                              sp: int, sy: float, ep: int, ey: float,
-                              is_dual: bool = False) -> list[int]:
-    """Return indices of sentence entries whose sub-sentences overlap the
-    document range from (sp, sy) to (ep, ey). Sorted by first-sub coordinate."""
-    group = _get_group(cache, file_path, is_dual)
+                              start_idx: int, end_idx: int) -> list[int]:
+    """Return indices of sentence entries whose sub-sentence idx ranges
+    overlap [start_idx, end_idx]. Sorted by first-sub start_idx."""
+    fe = _ensure_file(cache, file_path)
     results = []
-    for idx, entry in enumerate(group["sentences"]):
+    for idx, entry in enumerate(fe["sentences"]):
         for sub in entry.get("sentences", []):
-            if _ranges_overlap(
-                sub["start_page"], sub["start_y_pct"],
-                sub["end_page"], sub["end_y_pct"],
-                sp, sy, ep, ey,
-            ):
+            if sub["start_idx"] <= end_idx and sub["end_idx"] >= start_idx:
                 results.append(idx)
                 break
-    results.sort(key=lambda i: _sub_first(group["sentences"][i]["sentences"][0]))
+    results.sort(key=lambda i: _sub_first(fe["sentences"][i]["sentences"][0]))
     return results
 
 
 def find_containing_entries(cache: dict, file_path: str,
-                              sp: int, sy: float, sx: float,
-                              ep: int, ey: float, ex: float,
-                              is_dual: bool = False) -> list[int]:
-    """Return indices of sentence entries whose total range (first sub start
-    to last sub end) CONTAINS the query range. Query is a subset of entry.
-    Coordinate order: page > y_pct > x_pct, with COORD_TOLERANCE."""
-    group = _get_group(cache, file_path, is_dual)
+                             start_idx: int, end_idx: int) -> list[int]:
+    """Return indices of sentence entries whose total idx range
+    (first sub start to last sub end) CONTAINS [start_idx, end_idx].
+    Sorted by first-sub start_idx."""
+    fe = _ensure_file(cache, file_path)
     results = []
-    for idx, entry in enumerate(group["sentences"]):
+    for idx, entry in enumerate(fe["sentences"]):
         subs = entry.get("sentences", [])
         if not subs:
             continue
-        fs = subs[0]
-        ls = subs[-1]
-        # entry start <= query start
-        if not coord_le_tolerant(
-            fs["start_page"], fs["start_y_pct"], fs["start_x_pct"],
-            sp, sy, sx,
-        ):
-            continue
-        # query end <= entry end
-        if not coord_le_tolerant(
-            ep, ey, ex,
-            ls["end_page"], ls["end_y_pct"], ls["end_x_pct"],
-        ):
-            continue
-        results.append(idx)
-    results.sort(key=lambda i: _sub_first(group["sentences"][i]["sentences"][0]))
+        if subs[0]["start_idx"] <= start_idx and end_idx <= subs[-1]["end_idx"]:
+            results.append(idx)
+    results.sort(key=lambda i: _sub_first(fe["sentences"][i]["sentences"][0]))
     return results
 
 
-def merge_entries(cache: dict, file_path: str, indices: list[int],
-                  is_dual: bool = False) -> dict:
+def merge_entries(cache: dict, file_path: str, indices: list[int]) -> dict:
     """Merge sentence entries at given indices into one. Deletes originals.
     Returns the merged entry dict."""
-    group = _get_group(cache, file_path, is_dual)
-    entries = [group["sentences"][i] for i in indices]
+    fe = _ensure_file(cache, file_path)
+    entries = [fe["sentences"][i] for i in indices]
     entries.sort(key=lambda e: _sub_first(e["sentences"][0]))
 
     all_subs = []
@@ -239,11 +157,11 @@ def merge_entries(cache: dict, file_path: str, indices: list[int],
         all_subs.extend(e.get("sentences", []))
     all_subs.sort(key=_sub_first)
 
-    # Deduplicate by full start coordinate, keep the one with non-empty tgt
-    seen: dict[tuple, int] = {}
+    # Deduplicate by start_idx, keep non-empty tgt
+    seen: dict[int, int] = {}
     deduped: list[dict] = []
     for sub in all_subs:
-        key = (sub["start_page"], sub["start_y_pct"], sub["start_x_pct"])
+        key = sub["start_idx"]
         if key not in seen:
             seen[key] = len(deduped)
             deduped.append(sub)
@@ -273,17 +191,17 @@ def merge_entries(cache: dict, file_path: str, indices: list[int],
     }
 
     for i in sorted(indices, reverse=True):
-        group["sentences"].pop(i)
-    group["sentences"].append(merged)
+        fe["sentences"].pop(i)
+    fe["sentences"].append(merged)
     return merged
 
 
-def find_mergeable_fragments(cache: dict, file_path: str,
-                             is_dual: bool = False) -> tuple | None:
-    """Find one mergeable fragment pair. Returns (idx_a, idx_b, direction) or None.
-    direction='append' means B's sentences go after A's. Returns None if no pair found."""
-    group = _get_group(cache, file_path, is_dual)
-    entries = group.get("sentences", [])
+def find_mergeable_fragments(cache: dict, file_path: str) -> tuple | None:
+    """Find one mergeable fragment pair by idx adjacency.
+    Returns (idx_a, idx_b, direction) or None. direction='append' means
+    B's sentences go after A's."""
+    fe = _ensure_file(cache, file_path)
+    entries = fe.get("sentences", [])
 
     for i, entry in enumerate(entries):
         subs = entry.get("sentences", [])
@@ -291,28 +209,22 @@ def find_mergeable_fragments(cache: dict, file_path: str,
             continue
 
         if entry.get("head_fragment"):
-            first_sub = subs[0]
+            first_sub_start = subs[0]["start_idx"]
             for j, other in enumerate(entries):
                 if i == j:
                     continue
-                for other_sub in other.get("sentences", []):
-                    if _coord_eq(
-                        other_sub["end_page"], other_sub["end_x_pct"], other_sub["end_y_pct"],
-                        first_sub["end_page"], first_sub["end_x_pct"], first_sub["end_y_pct"],
-                    ):
-                        return (j, i, "append")
+                other_subs = other.get("sentences", [])
+                if other_subs and other_subs[-1]["end_idx"] + 1 == first_sub_start:
+                    return (j, i, "append")
 
         if entry.get("tail_fragment"):
-            last_sub = subs[-1]
+            last_sub_end = subs[-1]["end_idx"]
             for j, other in enumerate(entries):
                 if i == j:
                     continue
-                for other_sub in other.get("sentences", []):
-                    if _coord_eq(
-                        other_sub["start_page"], other_sub["start_x_pct"], other_sub["start_y_pct"],
-                        last_sub["start_page"], last_sub["start_x_pct"], last_sub["start_y_pct"],
-                    ):
-                        return (i, j, "append")
+                other_subs = other.get("sentences", [])
+                if other_subs and last_sub_end + 1 == other_subs[0]["start_idx"]:
+                    return (i, j, "append")
 
     return None
 
@@ -330,13 +242,8 @@ def get_cache_summary(cache: dict) -> list[dict]:
             continue
         if not isinstance(entry, dict):
             continue
-        phrase_count = 0
-        sent_count = 0
-        for group_key in ("single", "dual"):
-            group = entry.get(group_key, {}) if isinstance(entry, dict) else {}
-            if isinstance(group, dict):
-                phrase_count += len(group.get("phrases", []))
-                sent_count += len(group.get("sentences", []))
+        phrase_count = len(entry.get("phrases", []))
+        sent_count = len(entry.get("sentences", []))
         summaries.append({
             "file_path": fp,
             "filename": Path(fp).name,
@@ -349,8 +256,7 @@ def get_cache_summary(cache: dict) -> list[dict]:
 # ── Path utilities ─────────────────────────────────────────────────
 
 def auto_generate_per_pdf_path(pdf_path: str, suffix: str) -> str:
-    """Generate default per-PDF path in DATA_DIR with timestamp.
-    Example: /path/doc.pdf + '_cache' → {DATA_DIR}/doc_cache_250115143022.json"""
+    """Generate default per-PDF path in DATA_DIR with timestamp."""
     os.makedirs(DATA_DIR, exist_ok=True)
     p = Path(pdf_path)
     ts = datetime.now().strftime("%y%m%d%H%M%S")

@@ -19,7 +19,6 @@ DEFAULTS = {
     "current_prompt_file": "",
     "output_mode": "new",
     "paste_clean_enabled": False,
-    # Mode B: shared pool, own current selection only
     "mode_b_current_url": "",
     "mode_b_current_model": "",
     "mode_b_prompt": "",
@@ -123,7 +122,6 @@ def set_models_for_url(config: dict, url: str, models: list) -> None:
 # ── Path list helpers ─────────────────────────────────────────────────
 
 def _insert_at_front(lst: list, item: str) -> None:
-    """Move item to front of list; add if new."""
     item = item.strip()
     if not item:
         return
@@ -169,12 +167,12 @@ def get_or_create_pdf_history_entry(config: dict, pdf_path: str) -> dict:
     history: list = config.setdefault("pdf_history", [])
     for entry in history:
         if isinstance(entry, dict) and entry.get("path") == pdf_path:
-            entry.setdefault("config", {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None})
+            entry.setdefault("config", {"cache_file": None, "isolate_file": None, "layout_file": None, "note_file": None})
             return entry
     entry = {
         "path": pdf_path,
         "date": datetime.now().strftime("%Y-%m-%d-%H-%M-%S"),
-        "config": {"cache_file": None, "isolate_file": None, "dual_column": False, "note_file": None},
+        "config": {"cache_file": None, "isolate_file": None, "layout_file": None, "note_file": None},
     }
     history.insert(0, entry)
     return entry
@@ -182,7 +180,5 @@ def get_or_create_pdf_history_entry(config: dict, pdf_path: str) -> dict:
 
 def set_pdf_config_path(config: dict, pdf_path: str, key: str,
                         value: str | None) -> None:
-    """Update config.{key} in the pdf_history entry for pdf_path.
-    key is 'cache_file' or 'isolate_file'."""
     entry = get_or_create_pdf_history_entry(config, pdf_path)
     entry.setdefault("config", {})[key] = value
